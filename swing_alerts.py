@@ -1,9 +1,6 @@
 import datetime
 import smtplib
 import time
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import pandas as pd
 import pytz
 import yfinance as yf
 
@@ -27,27 +24,6 @@ CHECK_INTERVAL_SECONDS = 900
 
 # Tracker variable to prevent duplicate emails for the same 2-Hour candle
 last_alerted_candle_timestamp = None
-
-
-# =====================================================================
-# --- 2. EMAIL DELIVERY SYSTEM ---
-# =====================================================================
-def send_email_alert(subject, body):
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = SENDER_EMAIL
-        msg["To"] = RECEIVER_EMAIL
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-        server.quit()
-        print(f"[{datetime.datetime.now()}] Email alert sent successfully.")
-    except Exception as e:
-        print(f"[{datetime.datetime.now()}] Failed to send email alert: {e}")
 
 
 # =====================================================================

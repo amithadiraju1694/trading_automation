@@ -3,20 +3,18 @@
 import os
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import smtplib
 import schedule
 import time
-from email.message import EmailMessage
 from datetime import datetime
 import pytz
 from tqdm import tqdm
+import sys
+from helpers import send_email
 
 # ---------------- CONFIG ---------------- #
 # CRITICAL EMAIL FIX: If using Gmail, you MUST use an "App Password". 
 # Normal passwords will be blocked by Google security.
-EMAIL_ADDRESS = "amitadiraju3@gmail.com"
-EMAIL_PASSWORD = "cedh jcng vpuc onex" 
+FROM_EMAIL = "amitadiraju3@gmail.com"
 TO_EMAIL = "amith.adiraju@gmail.com"
 
 CSV_NAME = "squeeze_scan_results.csv"
@@ -198,65 +196,56 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
     # Print accurate numbers
     print(f"\nFound {len(results)} actionable Squeeze setups! Sending email now...")
     result_df = pd.DataFrame(results)
-    # result_df.to_csv(CSV_NAME, index=False)
+    result_df.to_csv(CSV_NAME, index=False)
     
     # Send email and print preview
-    send_email(CSV_NAME)
+    send_email(subject = f"Daily Squeeze Alerts",
+               body = "PFA",
+               from_email = FROM_EMAIL,
+               to_email = TO_EMAIL,
+               attachment=CSV_NAME)
     print("\n--- RESULTS PREVIEW ---")
-    print(result_df)
+    print(result_df.head())
 
 
-# ---------------- EMAIL ---------------- #
-def send_email(csv_file):
-    msg = EmailMessage()
-    msg["Subject"] = "Daily Squeeze Scanner Results"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-    msg.set_content("Attached are today's actionable squeeze scan results.")
-
-    try:
-        with open(csv_file, "rb") as f:
-            file_data = f.read()
-
-        msg.add_attachment(file_data, maintype="application", subtype="csv", filename=csv_file)
-
-        # Port 587 + starttls() is the most robust method for bypassing standard SMTP blocks
-        print("Connecting to SMTP server...")
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-            print("Email sent successfully!")
-
-    except smtplib.SMTPAuthenticationError:
-        print("EMAIL FAILED: Authentication Error. Ensure you are using a Gmail App Password, not your normal password.")
-    except Exception as e:
-        print(f"EMAIL FAILED: {e}")
 
 
 # ---------------- SCHEDULER ---------------- #
-def job():
+def job(run_type="SCHEDULED"):
+    """
+    Executes the trading logic. 
+    Accepts run_type to differentiate between test runs and scheduled runs in the logs.
+    """
     est = pytz.timezone("US/Eastern")
     now = datetime.now(est)
-    print(f"\n--- Running scan at: {now.strftime('%Y-%m-%d %H:%M:%S %Z')} ---")
     
-    # Your target scanning and trading logic goes here:
-    # run_scan() 
+    print(f"\n--- [{run_type} RUN] Executing scan at: {now.strftime('%Y-%m-%d %H:%M:%S %Z')} ---")
+    
+    # Actually calling your target scanning and trading logic
+    run_scan() 
+    
+    print(f"--- [{run_type} RUN] Scan complete. ---")
 
 
 def main():
-    runat = "17:00"
-    
-    # Explicitly passing the timezone string inside .at() requires schedule version 1.2.0+
-    schedule.every().day.at(runat, "US/Eastern").do(job)
-    
-    print(f"Scanner initialized. Waiting quietly in background to run daily at {runat} US/Eastern.")
-    # REMOVED: job() <- This line was causing the instant execution bug on startup.
+    # 1. Handle Immediate Test Run if flag is passed
+    if "--test" in sys.argv:
+        print("Test flag detected. Executing an immediate test run before scheduling...")
+        job(run_type="TEST")
+        print("Test run finished")
+    else:
+        # 2. Setup the Daily Schedule
+        runat = "17:00"
+        
+        # Pass the run_type argument directly into the .do() method
+        schedule.every().day.at(runat, "US/Eastern").do(job, run_type="SCHEDULED")
+        
+        print(f"Scanner initialized. Waiting quietly in background to run daily at {runat} US/Eastern.")
 
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+        # 3. Keep the script alive and checking the clock
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
 
 
 if __name__ == "__main__":
