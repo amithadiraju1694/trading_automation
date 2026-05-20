@@ -1,52 +1,47 @@
 import datetime
-import smtplib
 import time
-import pytz
 import yfinance as yf
+import pytz
+import pandas as pd
+import os
+from helpers import send_email
 
-# =====================================================================
-# --- 1. USER CONFIGURATION ---
-# =====================================================================
-TICKER = "AAPL"  # Change to any stock ticker
-SUPPORT_LEVEL = 80.0  # Your custom confluence support
-RESISTANCE_LEVEL = 110.0  # Your custom confluence resistance
-VOL_LENGTH = 24  # Rolling 2H bars to calculate baseline (~7 trading days)
+FROM_EMAIL = "amitadiraju3@gmail.com"
+TO_EMAIL = "amith.adiraju@gmail.com"
 
-# Email Setup (For Gmail, generate an 'App Password' instead of your main password)
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SENDER_EMAIL = "your_email@gmail.com"
-SENDER_PASSWORD = "your_app_password"
-RECEIVER_EMAIL = "recipient_email@gmail.com"
+'''
+CSV File Format
+Ticker,Support,Resistance,Vol_Length(Simple Look back Window)
+AAPL,165.50,175.20,14
+MDGL,90.00,102.50,14
+TSLA,200.00,215.00,14
 
-# Checking Interval (e.g., poll every 15 minutes to capture new bar completions)
-CHECK_INTERVAL_SECONDS = 900
+Monitoring two 1h candles
+# Change "2h" to "1h"
+df_2h = raw_data.resample("1h", origin="09:30:00").agg(agg_rules).dropna()
+'''
 
-# Tracker variable to prevent duplicate emails for the same 2-Hour candle
-last_alerted_candle_timestamp = None
+# Track timestamps per ticker: {'AAPL': '2023-10-25 14:00:00', 'MDGL': '...'}
+last_alerted_candles = {} 
+CHECK_INTERVAL_SECONDS = 120
 
+def check_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL_LENGTH):
+    global last_alerted_candles
 
-# =====================================================================
-# --- 3. ANALYTICS & EXECUTION ENGINE ---
-# =====================================================================
-def run_trading_logic():
-    global last_alerted_candle_timestamp
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Evaluating {TICKER}...")
 
-    print(f"[{datetime.datetime.now()}] Fetching data and verifying structures...")
-
-    # Fetch 30-minute intervals for the last month to construct clean 2H bars
+    # Fetch 30-minute intervals
     raw_data = yf.download(
         tickers=TICKER, period="1mo", interval="30m", progress=False
     )
 
     if raw_data.empty or len(raw_data) < 100:
-        print("Insufficient historical data fetched from Yahoo Finance.")
+        print(f"[{TICKER}] Insufficient historical data.")
         return
 
-    # Convert Index to Eastern Time to align perfectly with US Market sessions
     raw_data.index = raw_data.index.tz_convert("US/Eastern")
 
-    # Resample 30m candles into 2H candles, anchored precisely to market open (09:30 AM)
+    # Resample to 2H candles. This can change to two 1H candles if needed
     agg_rules = {
         "Open": "first",
         "High": "max",
@@ -55,32 +50,24 @@ def run_trading_logic():
         "Volume": "sum",
     }
     df_2h = raw_data.resample("2h", origin="09:30:00").agg(agg_rules).dropna()
-
-    # Calculate rolling Volume SMA strictly across 2-Hour blocks
     df_2h["Vol_SMA"] = df_2h["Volume"].rolling(window=VOL_LENGTH).mean()
 
-    # Ensure dataset is large enough to check history safely
     if len(df_2h) < (VOL_LENGTH + 4):
-        print("Dataframe processing window initialization incomplete.")
+        print(f"[{TICKER}] Dataframe processing window incomplete.")
         return
 
     # --- FIBONACCI REVERSAL MATHEMATICS ---
     price_range = RESISTANCE_LEVEL - SUPPORT_LEVEL
     bull_091 = SUPPORT_LEVEL + (price_range * 0.09)
     bear_091 = RESISTANCE_LEVEL - (price_range * 0.09)
-
-    # Risk Control Management Bounds (The Chasing Cap)
     bull_max_chase = SUPPORT_LEVEL + (price_range * 0.214)
     bear_max_chase = RESISTANCE_LEVEL - (price_range * 0.214)
 
     # --- EXTRACT FULLY CLOSED DATA ARRAYS ---
-    # iloc[-1] is the current open/uncompleted 2H candle.
-    # To match Pine Script's bar-close rules, we extract completely processed indices:
     latest_closed_bar = df_2h.iloc[-2]
     prev_closed_bar = df_2h.iloc[-3]
     two_bars_ago = df_2h.iloc[-4]
 
-    # Assign target analytical metrics
     c2h = float(latest_closed_bar["Close"])
     h2h = float(latest_closed_bar["High"])
     l2h = float(latest_closed_bar["Low"])
@@ -89,27 +76,26 @@ def run_trading_logic():
 
     c2h_prev = float(prev_closed_bar["Close"])
     v2h_prev = float(prev_closed_bar["Volume"])
-
     c2h_prev2 = float(two_bars_ago["Close"])
 
-    # Unique identification handle for the evaluated bar
     current_candle_time = str(df_2h.index[-2])
+    
+    # Initialize tracking for this ticker if it doesn't exist
+    if TICKER not in last_alerted_candles:
+        last_alerted_candles[TICKER] = None
 
     # --- VALIDATION GATES ---
-    # 1. Wick Proportions Check (Ensuring dominant institutional close)
     long_wick_ok = (h2h - c2h) <= ((h2h - l2h) * 0.35)
     short_wick_ok = (c2h - l2h) <= ((h2h - l2h) * 0.35)
-
-    # 2. Volume Consistency Verification
     volume_confirmed = (v2h > v2h_avg) and (v2h_prev > v2h_avg)
 
-    # 3. Structural Shifts Verification
     price_long_confirmed = (
         (c2h_prev2 <= bull_091)
         and (c2h_prev > bull_091)
         and (c2h > bull_091)
         and (c2h <= bull_max_chase)
     )
+    
     price_short_confirmed = (
         (c2h_prev2 >= bear_091)
         and (c2h_prev < bear_091)
@@ -122,7 +108,7 @@ def run_trading_logic():
         price_long_confirmed
         and volume_confirmed
         and long_wick_ok
-        and (current_candle_time != last_alerted_candle_timestamp)
+        and (current_candle_time != last_alerted_candles[TICKER])
     ):
         subject = f"SWING ALERT: PRECISE LONG CONFIRMED FOR {TICKER}"
         body = (
@@ -134,14 +120,15 @@ def run_trading_logic():
             f"- Validated Candle Timestamp: {current_candle_time}\n\n"
             f"Action: Evaluate execution parameters for standard Long entries."
         )
-        send_email_alert(subject, body)
-        last_alerted_candle_timestamp = current_candle_time
+        send_email(subject=subject, body=body, from_email=FROM_EMAIL, to_email=TO_EMAIL, attachment=None)
+        last_alerted_candles[TICKER] = current_candle_time
+        print(f"*** LONG ALERT SENT FOR {TICKER} ***")
 
     elif (
         price_short_confirmed
         and volume_confirmed
         and short_wick_ok
-        and (current_candle_time != last_alerted_candle_timestamp)
+        and (current_candle_time != last_alerted_candles[TICKER])
     ):
         subject = f"SWING ALERT: PRECISE SHORT CONFIRMED FOR {TICKER}"
         body = (
@@ -153,50 +140,54 @@ def run_trading_logic():
             f"- Validated Candle Timestamp: {current_candle_time}\n\n"
             f"Action: Evaluate execution parameters for standard Short entries."
         )
-        send_email_alert(subject, body)
-        last_alerted_candle_timestamp = current_candle_time
-    
-    else:
-        print(
-            f"Status Check: Criteria scanned. No valid configurations met for {TICKER} at closed timestamp {current_candle_time}."
-        )
+        send_email(subject=subject, body=body, from_email=FROM_EMAIL, to_email=TO_EMAIL, attachment=None)
+        last_alerted_candles[TICKER] = current_candle_time
+        print(f"*** SHORT ALERT SENT FOR {TICKER} ***")
 
 
-# =====================================================================
-# --- 4. CONTINUOUS MONITORING LOOP ---
-# =====================================================================
+
 if __name__ == "__main__":
     eastern = pytz.timezone("US/Eastern")
-    print("Initializing Automated Reversal Script Engine...")
+    print("Initializing Multi-Ticker Automated Reversal Script Engine...")
 
     while True:
         try:
             now = datetime.datetime.now(eastern)
 
-            # Check if current day is a weekday (Monday=0 to Friday=4)
+            # Check if current day is a weekday
             if now.weekday() < 5:
-                # Establish market bounds
-                market_open = now.replace(
-                    hour=9, minute=30, second=0, microsecond=0
-                )
-                market_close = now.replace(
-                    hour=16, minute=0, second=0, microsecond=0
-                )
+                market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
                 if market_open <= now <= market_close:
-                    run_trading_logic()
+                    
+                    # Read Watchlist dynamically every loop
+                    if os.path.exists("watchlist.csv"):
+                        watchlist = pd.read_csv("watchlist.csv")
+                        
+                        for index, row in watchlist.iterrows():
+                            ticker = str(row['Ticker']).strip()
+                            support = float(row['Support'])
+                            resistance = float(row['Resistance'])
+                            vol_len = int(row['Vol_Length'])
+                            
+                            check_entry_confirmation(ticker, support, resistance, vol_len)
+                            
+                            # Pause briefly between tickers to prevent yfinance rate limiting
+                            time.sleep(2) 
+                    else:
+                        print("watchlist.csv not found. Please create it.")
+                    
+                    print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
                     time.sleep(CHECK_INTERVAL_SECONDS)
                 else:
-                    print(
-                        f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Market is currently closed. Sleeping for 60 seconds..."
-                    )
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Market closed. Sleeping 60s...")
                     time.sleep(60)
             else:
-                print(
-                    f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Weekend Mode Active. Sleeping for 300 seconds..."
-                )
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Weekend Mode Active. Sleeping 300s...")
                 time.sleep(300)
 
         except Exception as global_error:
             print(f"Runtime Exception Intercepted: {global_error}")
-            time.sleep(60)  # Cool down before trying again if internet drops
+            time.sleep(60)
+

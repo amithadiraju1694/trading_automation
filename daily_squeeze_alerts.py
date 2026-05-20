@@ -1,5 +1,3 @@
-# pip install yfinance pandas numpy schedule pytz tqdm
-
 import os
 import yfinance as yf
 import pandas as pd
@@ -9,11 +7,10 @@ from datetime import datetime
 import pytz
 from tqdm import tqdm
 import sys
+import numpy as np
 from helpers import send_email
 
 # ---------------- CONFIG ---------------- #
-# CRITICAL EMAIL FIX: If using Gmail, you MUST use an "App Password". 
-# Normal passwords will be blocked by Google security.
 FROM_EMAIL = "amitadiraju3@gmail.com"
 TO_EMAIL = "amith.adiraju@gmail.com"
 
@@ -125,7 +122,118 @@ def filter_by_perc_move(tickers, percent_move):
     return filtered
 
 
-# ---------------- MAIN SCAN ---------------- #
+def generate_adirindic_signal(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes the 1-year OHLCV DataFrame from run_scan and applies the ADIRINDIC logic.
+    Computes its own internal single-day squeeze status purely for score weighting.
+    Returns the DataFrame with added BUY_SIGNAL and SELL_SIGNAL columns.
+    """
+    # Copy to avoid modifying the original dataframe used by other functions
+    df = df.copy()
+    
+    # --- Helper: True Range & ATR ---
+    tr1 = df['High'] - df['Low']
+    tr2 = (df['High'] - df['Close'].shift(1)).abs()
+    tr3 = (df['Low'] - df['Close'].shift(1)).abs()
+    df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    df['ATR_14'] = df['TR'].ewm(alpha=1/14, adjust=False).mean()
+    df['ATR_20'] = df['TR'].ewm(alpha=1/20, adjust=False).mean()
+
+    # --- Indicator Setup ---
+    df['SMA_200'] = df['Close'].rolling(window=200).mean()
+    df['SMA_50']  = df['Close'].rolling(window=50).mean()
+    df['SMA_20']  = df['Close'].rolling(window=20).mean()
+    df['EMA_21']  = df['Close'].ewm(span=21, adjust=False).mean()
+    df['VWMA_14'] = (df['Close'] * df['Volume']).rolling(14).sum() / df['Volume'].rolling(14).sum()
+    df['STD_20']  = df['Close'].rolling(window=20).std(ddof=0)
+
+    # --- Internal Single-Day Squeeze Logic for ADIRINDIC ---
+    df['BB_upper'] = df['SMA_20'] + (2.0 * df['STD_20'])
+    df['BB_lower'] = df['SMA_20'] - (2.0 * df['STD_20'])
+    df['KC_mid']   = df['SMA_20']
+    df['KC_upper'] = df['KC_mid'] + (1.5 * df['ATR_20'])
+    df['KC_lower'] = df['KC_mid'] - (1.5 * df['ATR_20'])
+
+    # Single day squeeze check
+    df['Squeeze_on'] = (df['BB_upper'] < df['KC_upper']) & (df['BB_lower'] > df['KC_lower'])
+
+    squeeze_active = df['Squeeze_on'] | df['Squeeze_on'].shift(1) | df['Squeeze_on'].shift(2)
+    df['Bull_Squeeze'] = squeeze_active & (df['Close'] > df['KC_mid'])
+    df['Bear_Squeeze'] = squeeze_active & (df['Close'] < df['KC_mid'])
+
+    # --- Candlestick Scanners ---
+    df['Body_Size']  = (df['Close'] - df['Open']).abs()
+    df['Range_Size'] = df['High'] - df['Low']
+    df['Is_Doji']    = df['Body_Size'] <= (df['Range_Size'] * 0.1)
+
+    df['Bull_Doji'] = df['Is_Doji'] & (df['Close'] >= df['Close'].shift(1))
+    df['Bear_Doji'] = df['Is_Doji'] & (df['Close'] <= df['Close'].shift(1))
+
+    df['Bull_Eng'] = (df['Close'].shift(1) < df['Open'].shift(1)) & \
+                     (df['Close'] > df['Open']) & \
+                     (df['Close'] >= df['Open'].shift(1)) & \
+                     (df['Open'] <= df['Close'].shift(1))
+                     
+    df['Bear_Eng'] = (df['Close'].shift(1) > df['Open'].shift(1)) & \
+                     (df['Close'] < df['Open']) & \
+                     (df['Close'] <= df['Open'].shift(1)) & \
+                     (df['Open'] >= df['Close'].shift(1))
+
+    df['Bull_Candle'] = df['Bull_Eng'] | df['Bull_Doji']
+    df['Bear_Candle'] = df['Bear_Eng'] | df['Bear_Doji']
+
+    # --- Order Flow (Supply & Demand) ---
+    # Ensure your pivot lookback window helper function has enough padding
+    def get_pivot(x, is_high=True):
+        if len(x) < 11: return np.nan
+        # x[5] is the center bar of an 11-bar array (5 left, center, 5 right)
+        center = x[5] 
+        if is_high and center == max(x): return center
+        if not is_high and center == min(x): return center
+        return np.nan
+
+    df['Pivot_High'] = df['High'].rolling(window=11).apply(lambda x: get_pivot(x, True), raw=True)
+    df['Pivot_Low']  = df['Low'].rolling(window=11).apply(lambda x: get_pivot(x, False), raw=True)
+    df['Supply_Zone'] = df['Pivot_High'].ffill()
+    df['Demand_Zone'] = df['Pivot_Low'].ffill()
+
+    df['Bull_SD'] = (df['Close'] <= df['Demand_Zone'] + (df['ATR_14'] * 1.5)) | (df['Close'] > df['Supply_Zone'])
+    df['Bear_SD'] = (df['Close'] >= df['Supply_Zone'] - (df['ATR_14'] * 1.5)) | (df['Close'] < df['Demand_Zone'])
+
+    # --- Score Generation ---
+    w_trend, w_mom, w_vol, w_kc, w_sd, w_candle, threshold = 20, 15, 15, 15, 25, 10, 51
+
+    df['Bull_Score'] = (
+        np.where(df['Close'] > df['SMA_50'], w_trend, 0) +
+        np.where(df['Close'] > df['EMA_21'], w_mom, 0) +
+        np.where(df['Close'] > df['VWMA_14'], w_vol, 0) +
+        np.where(df['Bull_Squeeze'], w_kc, 0) +
+        np.where(df['Bull_SD'], w_sd, 0) +
+        np.where(df['Bull_Candle'], w_candle, 0)
+    )
+
+    df['Bear_Score'] = (
+        np.where(df['Close'] < df['SMA_50'], w_trend, 0) +
+        np.where(df['Close'] < df['EMA_21'], w_mom, 0) +
+        np.where(df['Close'] < df['VWMA_14'], w_vol, 0) +
+        np.where(df['Bear_Squeeze'], w_kc, 0) +
+        np.where(df['Bear_SD'], w_sd, 0) +
+        np.where(df['Bear_Candle'], w_candle, 0)
+    )
+
+    df['Long_Condition']  = df['Bull_Score'] >= threshold
+    df['Short_Condition'] = df['Bear_Score'] >= threshold
+
+    df['BUY_SIGNAL']  = df['Long_Condition'] & ~df['Long_Condition'].shift(1).fillna(False)
+    df['SELL_SIGNAL'] = df['Short_Condition'] & ~df['Short_Condition'].shift(1).fillna(False)
+
+    
+    return df
+    
+
+
+
 def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
     if filtered_tickers is None:
         if os.path.exists(FILTERED_MKT_CAP_CSV):
@@ -139,74 +247,87 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
         print("No tickers available after filtering. Nothing to scan.")
         return
 
-    print(f"\nScanning {len(filtered_tickers)} filtered tickers for Squeezes...")
+    print(f"\nScanning {len(filtered_tickers)} filtered tickers for Squeezes & ADIRINDIC Signals...")
     results = []
 
-    for ticker in tqdm(filtered_tickers, desc="Checking Squeeze Logic"):
+    for ticker in tqdm(filtered_tickers, desc="Evaluating Trading Logic"):
         try:
+            # 1. Fetch 1y data to ensure the 200 SMA padding works in the indicator
             stock = yf.Ticker(ticker)
-            df = stock.history(period="6mo")
+            df = stock.history(period="max", auto_adjust = False, actions = False)
 
-            # Handle delisted/empty data cleanly
-            if df is None or df.empty or len(df) < 100:
+            if df is None or df.empty or len(df) < 250:
                 continue
 
-            # Compute indicators
-            squeeze = compute_squeeze(df)
+            # 2. Compute 6-day Squeeze using original external function
+            squeeze_series = compute_squeeze(df)
             
-            # Need at least 7 days to evaluate 6 days of squeeze + 1 day of firing
-            last_7 = squeeze.tail(7).tolist()
-            if len(last_7) < 7:
+            if len(squeeze_series) < 7:
                 continue
 
-            # LOGIC 1: Is it currently in a 6-day squeeze? (Looking at the most recent 6 days)
-            in_6_day_squeeze = "YES" if all(last_7[-6:]) else "NO"
+            # LOGIC 1: Is it currently in a 6-day squeeze? (The last 6 days up to today are True)
+            in_6_day_squeeze = "YES" if squeeze_series.iloc[-6:].all() else "NO"
 
-            # LOGIC 2: Did it squeeze for 6 days, and FIRE on the 7th?
-            six_days_prior_squeeze = all(last_7[:6]) # Days 1 through 6 were True
-            fired_on_7th = not last_7[6]             # Day 7 (Today) is False
+            # LOGIC 2: Did it squeeze for 6 days prior to today, and FIRE today?
+            # Days -7 to -2 (the 6 days before today) were True, and Day -1 (Today) is False
+            six_days_prior_squeeze = squeeze_series.iloc[-7:-1].all()
+            fired_on_7th = not squeeze_series.iloc[-1]
             squeeze_fired = "YES" if (six_days_prior_squeeze and fired_on_7th) else "NO"
 
-            # ONLY append to our list if it is actively doing one of these two things!
-            if in_6_day_squeeze == "YES" or squeeze_fired == "YES":
-                ema_position = compute_ema_position(df)
-                stock_price = df['Close'].iloc[-1]
-                year_of_ipo = None
-                try:
-                    year_of_ipo = stock.info.get("ipoYear")
-                except Exception:
-                    year_of_ipo = None
+            # 3. Compute ADIRINDIC signals passing the fetched df
+            adir_df = generate_adirindic_signal(df)
+            
+            # Extract any signals from Day 't' down to 't-7'
+            lookback_window = adir_df.tail(8)
+            signals_found = []
+            
+            for timestamp, row in lookback_window.iterrows():
+                date_str = timestamp.strftime('%Y-%m-%d')
+                if row.get('BUY_SIGNAL'):
+                    signals_found.append(f"BUY @ ${row['Low']:.2f} ({date_str})")
+                if row.get('SELL_SIGNAL'):
+                    signals_found.append(f"SELL @ ${row['High']:.2f} ({date_str})")
 
+            # 4. Actionable Filter: ONLY append if it meets the main criteria
+            if in_6_day_squeeze == "YES" or squeeze_fired == "YES" or len(signals_found) > 0:
+                
+                # Rule: Only compute EMA if it's currently in a 6-day squeeze
+                ema_position = "N/A"
+                if in_6_day_squeeze == "YES":
+                    ema_position = compute_ema_position(df)
+                
+                adirindic_value = " | ".join(signals_found) if signals_found else "NONE"
+                stock_price = df['Close'].iloc[-1]
+                
                 results.append({
                     "STOCK TICKER": ticker,
-                    "STOCK PRICE": stock_price,
-                    "YEAR OF IPO": year_of_ipo,
+                    "STOCK PRICE": round(stock_price, 2),
                     "IN 6 DAY SQUEEZE": in_6_day_squeeze,
                     "SQUEEZE_FIRED": squeeze_fired,
-                    "PRICE RELATIVE TO EMA": ema_position
+                    "PRICE RELATIVE TO EMA": ema_position,
+                    "ADIRINDIC": adirindic_value
                 })
 
         except Exception:
             continue
 
     if len(results) == 0:
-        print("\nNo stocks met the Squeeze criteria today.")
+        print("\nNo stocks met the criteria today.")
         return
 
-    # Print accurate numbers
-    print(f"\nFound {len(results)} actionable Squeeze setups! Sending email now...")
+    print(f"\nFound {len(results)} actionable setups! Sending email now...")
     result_df = pd.DataFrame(results)
     result_df.to_csv(CSV_NAME, index=False)
     
-    # Send email and print preview
-    send_email(subject = f"Daily Squeeze Alerts",
-               body = "PFA",
-               from_email = FROM_EMAIL,
-               to_email = TO_EMAIL,
-               attachment=CSV_NAME)
+    send_email(
+        subject="Daily Squeeze & Indicator Alerts",
+        body="Please find attached today's tracking results.",
+        from_email=FROM_EMAIL,
+        to_email=TO_EMAIL,
+        attachment=CSV_NAME
+    )
     print("\n--- RESULTS PREVIEW ---")
     print(result_df.head())
-
 
 
 
