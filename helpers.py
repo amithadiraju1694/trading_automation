@@ -2,6 +2,10 @@ import os
 import mimetypes
 import smtplib
 from email.message import EmailMessage
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import yfinance as yf
 
 
 def send_email(subject, body, from_email, to_email, attachment=None):
@@ -70,3 +74,153 @@ def send_email(subject, body, from_email, to_email, attachment=None):
         print(f"EMAIL FAILED: {e}")
         return False
 
+
+# ---------------- INDICATORS ---------------- #
+def compute_squeeze(df):
+    length = 20
+
+    # Bollinger Bands
+    sma = df['Close'].rolling(length).mean()
+    std = df['Close'].rolling(length).std()
+    bb_upper = sma + (2 * std)
+    bb_lower = sma - (2 * std)
+
+    # Keltner Channels
+    tr1 = df['High'] - df['Low']
+    tr2 = abs(df['High'] - df['Close'].shift())
+    tr3 = abs(df['Low'] - df['Close'].shift())
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(length).mean()
+    kc_upper = sma + (1.5 * atr)
+    kc_lower = sma - (1.5 * atr)
+
+    # Squeeze is ON when Bollinger Bands are completely inside Keltner Channels
+    squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+    return squeeze_on
+
+
+
+
+def compute_rsi(df, period=14):
+    """Calculates the Relative Strength Index (RSI) using Wilder's Smoothing."""
+    delta = df['Close'].diff()
+    
+    # Separate gains and losses
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    # Wilder's Smoothing
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+def compute_adx(df, period=14):
+    """Calculates the Average Directional Index (ADX) using Wilder's Smoothing."""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    
+    # Plus/Minus Directional Movement
+    up_move = high.diff()
+    down_move = low.diff()
+    
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
+    # True Range
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Wilder's Smoothing for TR and DM
+    tr_smoothed = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smoothed)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / tr_smoothed)
+    
+    # Directional Index (DX) and ADX
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    
+    return adx
+
+# ---------------- GET ALL STOCKS ---------------- #
+def get_all_tickers():
+    nasdaq = pd.read_csv(
+        "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
+    )
+    tickers = nasdaq["Symbol"].dropna().tolist()
+
+    # Remove weird tickers and warrants
+    tickers = [t for t in tickers if "-" not in t and "^" not in t and "." not in t]
+    return tickers
+
+def compute_ema_position(df):
+    emas = [8, 21, 34, 55, 89]
+    ema_values = []
+
+    for e in emas:
+        ema = df['Close'].ewm(span=e, adjust=False).mean()
+        ema_values.append(ema.iloc[-1])
+
+    close = df['Close'].iloc[-1]
+
+    if close > max(ema_values):
+        return "ABOVE"
+    elif close < min(ema_values):
+        return "BELOW"
+    else:
+        return "BETWEEN"
+
+def filter_by_mkt_cap(tickers_or_csv):
+    if isinstance(tickers_or_csv, str) and tickers_or_csv.lower().endswith(".csv"):
+        df = pd.read_csv(tickers_or_csv)
+        if df.empty:
+            return []
+        first_col = df.columns[0]
+        return df[first_col].dropna().astype(str).tolist()
+
+    filtered = []
+    for ticker in tqdm(tickers_or_csv, desc="Filtering Market Cap"):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.fast_info # faster than stock.info
+            market_cap = info.get("market_cap", 0)
+
+            if market_cap >= 100_000_000:
+                filtered.append(ticker)
+        except Exception:
+            # Silently catch delisted tickers
+            continue
+
+    pd.DataFrame({"TICKER": filtered}).to_csv(FILTERED_MKT_CAP_CSV, index=False)
+    return filtered
+
+
+def filter_by_perc_move(tickers, percent_move):
+    filtered = []
+    for ticker in tqdm(tickers, desc="Filtering stocks for % move"):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period="1mo") # Changed to 1mo for speed
+
+            if df is None or df.empty or len(df) < 2:
+                continue
+
+            last_close = df['Close'].iloc[-1]
+            if last_close <= 7:
+                continue
+
+            daily_move = (abs(last_close - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+
+            if daily_move >= percent_move:
+                filtered.append(ticker)
+        except Exception:
+            continue
+
+    return filtered

@@ -8,7 +8,16 @@ import pytz
 from tqdm import tqdm
 import sys
 import numpy as np
-from helpers import send_email
+from helpers import (
+    send_email,
+    compute_adx,
+    compute_rsi,
+    compute_squeeze,
+    get_all_tickers,
+    compute_ema_position,
+    filter_by_mkt_cap,
+    filter_by_perc_move
+)
 
 # ---------------- CONFIG ---------------- #
 FROM_EMAIL = "amitadiraju3@gmail.com"
@@ -16,110 +25,120 @@ TO_EMAIL = "amith.adiraju@gmail.com"
 
 CSV_NAME = "squeeze_scan_results.csv"
 FILTERED_MKT_CAP_CSV = "filtered_by_market_cap.csv"
-DEFAULT_PERCENT_MOVE = 3.0
-
-# ---------------- GET ALL STOCKS ---------------- #
-def get_all_tickers():
-    nasdaq = pd.read_csv(
-        "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
-    )
-    tickers = nasdaq["Symbol"].dropna().tolist()
-
-    # Remove weird tickers and warrants
-    tickers = [t for t in tickers if "-" not in t and "^" not in t and "." not in t]
-    return tickers
+DEFAULT_PERCENT_MOVE = 1.8
 
 
-# ---------------- INDICATORS ---------------- #
-def compute_squeeze(df):
-    length = 20
+def get_sr_and_atr_distances(df, min_touches=5, tolerance_pct=0.015, atr_length=14, min_bars_between_touches=15):
+    """
+    Identifies Key Support/Resistance zones based on minimum historical touches.
+    Forces strict chronological separation between touches to ensure they are 
+    true historical tests, not just multi-day consolidations.
+    """
+    if len(df) < (atr_length + 10):
+        return {"ATR_DIST_FROM_SUPPORT": "N/A", "ATR_DIST_FROM_RESISTANCE": "N/A"}
 
-    # Bollinger Bands
-    sma = df['Close'].rolling(length).mean()
-    std = df['Close'].rolling(length).std()
-    bb_upper = sma + (2 * std)
-    bb_lower = sma - (2 * std)
+    df = df.copy()
+    
+    # Assign an absolute integer index to track time distance between touches
+    df['Bar_Num'] = range(len(df))
 
-    # Keltner Channels
+    # 1. Calculate ATR
     tr1 = df['High'] - df['Low']
-    tr2 = abs(df['High'] - df['Close'].shift())
-    tr3 = abs(df['Low'] - df['Close'].shift())
+    tr2 = (df['High'] - df['Close'].shift(1)).abs()
+    tr3 = (df['Low'] - df['Close'].shift(1)).abs()
+    df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=atr_length).mean()
 
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(length).mean()
-    kc_upper = sma + (1.5 * atr)
-    kc_lower = sma - (1.5 * atr)
+    # 2. Find True Swing Highs and Lows
+    # Using window=11 center=True means 5 days before, the day itself, and 5 days after
+    df['Max_11'] = df['High'].rolling(window=11, center=True).max()
+    df['Min_11'] = df['Low'].rolling(window=11, center=True).min()
 
-    # Squeeze is ON when Bollinger Bands are completely inside Keltner Channels
-    squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
-    return squeeze_on
+    df['Is_Peak'] = df['High'] == df['Max_11']
+    df['Is_Trough'] = df['Low'] == df['Min_11']
 
+    # Extract the prices and their specific bar numbers
+    peaks = df[df['Is_Peak']][['High', 'Bar_Num']].dropna()
+    troughs = df[df['Is_Trough']][['Low', 'Bar_Num']].dropna()
 
-def compute_ema_position(df):
-    emas = [8, 21, 34, 55, 89]
-    ema_values = []
-
-    for e in emas:
-        ema = df['Close'].ewm(span=e, adjust=False).mean()
-        ema_values.append(ema.iloc[-1])
-
-    close = df['Close'].iloc[-1]
-
-    if close > max(ema_values):
-        return "ABOVE"
-    elif close < min(ema_values):
-        return "BELOW"
-    else:
-        return "BETWEEN"
-
-
-def filter_by_mkt_cap(tickers_or_csv):
-    if isinstance(tickers_or_csv, str) and tickers_or_csv.lower().endswith(".csv"):
-        df = pd.read_csv(tickers_or_csv)
-        if df.empty:
+    # 3. Clustering & Chronological Validation
+    def find_valid_zones(pivots_df, price_col, tol, min_req_touches, min_separation):
+        if pivots_df.empty:
             return []
-        first_col = df.columns[0]
-        return df[first_col].dropna().astype(str).tolist()
+        
+        # Sort entirely by price to group similar levels together
+        sorted_pivots = pivots_df.sort_values(by=price_col)
+        
+        prices = sorted_pivots[price_col].values
+        bar_nums = sorted_pivots['Bar_Num'].values
+        
+        clusters = []
+        current_cluster_prices = [prices[0]]
+        current_cluster_bars = [bar_nums[0]]
 
-    filtered = []
-    for ticker in tqdm(tickers_or_csv, desc="Filtering Market Cap"):
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.fast_info # faster than stock.info
-            market_cap = info.get("market_cap", 0)
+        # Group prices within the tolerance %
+        for i in range(1, len(prices)):
+            cluster_avg = np.mean(current_cluster_prices)
+            
+            if abs(prices[i] - cluster_avg) / cluster_avg <= tol:
+                current_cluster_prices.append(prices[i])
+                current_cluster_bars.append(bar_nums[i])
+            else:
+                clusters.append((current_cluster_prices, current_cluster_bars))
+                current_cluster_prices = [prices[i]]
+                current_cluster_bars = [bar_nums[i]]
+        clusters.append((current_cluster_prices, current_cluster_bars))
 
-            if market_cap >= 100_000_000:
-                filtered.append(ticker)
-        except Exception:
-            # Silently catch delisted tickers
-            continue
+        valid_zones = []
 
-    pd.DataFrame({"TICKER": filtered}).to_csv(FILTERED_MKT_CAP_CSV, index=False)
-    return filtered
+        # Validate each cluster chronologically
+        for cluster_prices, cluster_bars in clusters:
+            # Sort the bar numbers chronologically to check distance between touches
+            sorted_time_bars = sorted(cluster_bars)
+            
+            valid_touches = 1
+            last_touch_bar = sorted_time_bars[0]
+            
+            for current_bar in sorted_time_bars[1:]:
+                # Only count the touch if it happened 'min_separation' days after the last one
+                if (current_bar - last_touch_bar) >= min_separation:
+                    valid_touches += 1
+                    last_touch_bar = current_bar
+                    
+            if valid_touches >= min_req_touches:
+                valid_zones.append(np.mean(cluster_prices))
+                
+        return valid_zones
 
+    # Extract valid zones using 5 touches and 15 days of separation
+    valid_resistances = find_valid_zones(peaks, 'High', tolerance_pct, min_touches, min_bars_between_touches)
+    valid_supports = find_valid_zones(troughs, 'Low', tolerance_pct, min_touches, min_bars_between_touches)
 
-def filter_by_perc_move(tickers, percent_move):
-    filtered = []
-    for ticker in tqdm(tickers, desc="Filtering stocks for % move"):
-        try:
-            stock = yf.Ticker(ticker)
-            df = stock.history(period="1mo") # Changed to 1mo for speed
+    # 4. Find Nearest Zones & Calculate ATR Distance
+    current_price = df['Close'].iloc[-1]
+    current_atr = df['ATR'].iloc[-1]
 
-            if df is None or df.empty or len(df) < 2:
-                continue
+    if pd.isna(current_atr) or current_atr == 0:
+        return {"ATR_DIST_FROM_SUPPORT": "N/A", "ATR_DIST_FROM_RESISTANCE": "N/A"}
 
-            last_close = df['Close'].iloc[-1]
-            if last_close <= 7:
-                continue
+    # Nearest Support (Must be BELOW current price)
+    supports_below = [s for s in valid_supports if s < current_price]
+    nearest_support = max(supports_below) if supports_below else None
 
-            daily_move = (abs(last_close - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+    # Nearest Resistance (Must be ABOVE current price)
+    resistances_above = [r for r in valid_resistances if r > current_price]
+    nearest_resistance = min(resistances_above) if resistances_above else None
 
-            if daily_move >= percent_move:
-                filtered.append(ticker)
-        except Exception:
-            continue
+    # 5. Math: (Distance to Level) / ATR
+    dist_supp = round((current_price - nearest_support) / current_atr, 2) if nearest_support else "NO KEY SUPP"
+    dist_res = round((nearest_resistance - current_price) / current_atr, 2) if nearest_resistance else "NO KEY RES"
 
-    return filtered
+    return {
+        "ATR_DIST_FROM_SUPPORT": dist_supp,
+        "ATR_DIST_FROM_RESISTANCE": dist_res,
+        "NEAREST_SUPPORT": nearest_support,
+        "NEAREST_RESISTANCE": nearest_resistance
+    }
 
 
 def generate_adirindic_signal(df: pd.DataFrame) -> pd.DataFrame:
@@ -381,6 +400,16 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
 
             if df is None or df.empty or len(df) < 250:
                 continue
+            
+
+            # ---> 1. NEW: CALCULATE RSI & ADX <---
+            df['RSI_14'] = compute_rsi(df, period=14)
+            df['ADX_14'] = compute_adx(df, period=14)
+            
+            # Extract the current day's value and round it cleanly
+            current_rsi = round(df['RSI_14'].iloc[-1], 2)
+            current_adx = round(df['ADX_14'].iloc[-1], 2)
+
 
             # 2. Compute 6-day Squeeze metrics
             squeeze_series = compute_squeeze(df)
@@ -398,7 +427,17 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
 
             # 3. Compute Strategy Signals
             adir_df = generate_adirindic_signal(df)
-            kelfry_df = generate_kelfry_signal(df)
+            kelfry_df = generate_kelfry_signal(df)    
+            ema_position = compute_ema_position(df)
+
+            # 4. Computing Distance from Key levels for this ticker
+            # Using 1.5% tolerance (0.015) for zone clustering. Only sending 3 years to counter stock split s&r levels
+            sr_metrics = get_sr_and_atr_distances(
+                df.tail(750), 
+                min_touches=3, 
+                tolerance_pct=0.015, 
+                atr_length=14
+            )
             
             # Extract ADIRINDIC signals from Day 't' down to 't-7'
             adir_lookback = adir_df.tail(8)
@@ -426,11 +465,6 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                 len(adir_signals) > 0 or 
                 len(kelfry_signals) > 0):
                 
-                # Rule: Only compute EMA if it's currently in a 6-day squeeze
-                ema_position = "N/A"
-                if in_6_day_squeeze == "YES":
-                    ema_position = compute_ema_position(df)
-                
                 adir_value = " | ".join(adir_signals) if adir_signals else "NONE"
                 kelfry_value = " | ".join(kelfry_signals) if kelfry_signals else "NONE"
                 stock_price = df['Close'].iloc[-1]
@@ -442,7 +476,13 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                     "SQUEEZE_FIRED": squeeze_fired,
                     "PRICE RELATIVE TO EMA": ema_position,
                     "ADIRINDIC": adir_value,
-                    "KELFRY98": kelfry_value
+                    "KELFRY98": kelfry_value,
+                    "ATR DIST TO SUPPORT": sr_metrics["ATR_DIST_FROM_SUPPORT"],
+                    "ATR DIST TO RESISTANCE": sr_metrics["ATR_DIST_FROM_RESISTANCE"],
+                    "NEAREST_SUPPORT": sr_metrics['NEAREST_SUPPORT'],
+                    "NEAREST_RESISTANCE": sr_metrics['NEAREST_RESISTANCE'],
+                    "RSI (14)": current_rsi,
+                    "ADX (14)": current_adx
                 })
 
         except Exception:
@@ -454,7 +494,7 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
 
     print(f"\nFound {len(results)} actionable setups! Sending email now...")
     result_df = pd.DataFrame(results)
-    result_df.to_csv(CSV_NAME, index=False)
+    result_df.to_csv(CSV_NAME, index=True)
     
     send_email(
         subject="Daily Squeeze & Indicator Alerts",
