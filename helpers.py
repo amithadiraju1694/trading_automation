@@ -7,7 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 import yfinance as yf
 
-
+FILTERED_MKT_CAP_CSV = "filtered_by_market_cap.csv"
 def send_email(subject, body, from_email, to_email, attachment=None):
     """
     Send an email with optional attachment.
@@ -149,34 +149,48 @@ def compute_adx(df, period=14):
     
     return adx
 
+
+import pandas as pd
+import yfinance as yf
+from tqdm import tqdm
+
+FILTERED_MKT_CAP_CSV = "filtered_market_cap.csv"
+
 # ---------------- GET ALL STOCKS ---------------- #
 def get_all_tickers():
-    nasdaq = pd.read_csv(
-        "https://raw.githubusercontent.com/datasets/nasdaq-listings/master/data/nasdaq-listed-symbols.csv"
-    )
-    tickers = nasdaq["Symbol"].dropna().tolist()
+    """Fetches real-time US tickers (NASDAQ, NYSE, AMEX) directly from NASDAQ Trader."""
+    try:
+        # Fetch both NASDAQ and non-NASDAQ (Other) listings
+        nasdaq_url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+        other_url = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+        
+        nasdaq = pd.read_csv(nasdaq_url, sep="|")
+        other = pd.read_csv(other_url, sep="|")
+        
+        # Remove the text footer row ("File Creation Time...") that NASDAQ appends
+        nasdaq = nasdaq[nasdaq["Symbol"].str.contains("File Creation Time", na=False) == False]
+        other = other[other["ACT Symbol"].str.contains("File Creation Time", na=False) == False]
+        
+        # Filter out Test listings
+        nasdaq = nasdaq[nasdaq["Test Issue"] == "N"]
+        other = other[other["Test Issue"] == "N"]
+        
+        # Combine lists
+        tickers = nasdaq["Symbol"].dropna().tolist() + other["ACT Symbol"].dropna().tolist()
+        
+        # Filter out warrants, preferred shares, and weird tickers
+        tickers = [t for t in tickers if not any(char in t for char in ["-", "^", ".", "$"])]
+        
+        return sorted(list(set(tickers)))
+        
+    except Exception as e:
+        print(f"Error fetching ticker directory: {e}")
+        return []
 
-    # Remove weird tickers and warrants
-    tickers = [t for t in tickers if "-" not in t and "^" not in t and "." not in t]
-    return tickers
-
-def compute_ema_position(df):
-    emas = [8, 21, 34, 55, 89]
-    ema_values = []
-
-    for e in emas:
-        ema = df['Close'].ewm(span=e, adjust=False).mean()
-        ema_values.append(ema.iloc[-1])
-
-    close = df['Close'].iloc[-1]
-
-    if close > max(ema_values):
-        return "ABOVE"
-    elif close < min(ema_values):
-        return "BELOW"
-    else:
-        return "BETWEEN"
-
+#TODO: Filter functions are too slow, is it the WiFi or Code? Check it.
+#TODO: Filtering for 1-2% movers out of specific market cap gives too many stocks ( ~2K ) what other basic filters to trim down to few high probability setups
+# either breakout wise or trend wise ( near supp & res )
+# ---------------- FILTER BY MARKET CAP ---------------- #
 def filter_by_mkt_cap(tickers_or_csv):
     if isinstance(tickers_or_csv, str) and tickers_or_csv.lower().endswith(".csv"):
         df = pd.read_csv(tickers_or_csv)
@@ -189,16 +203,24 @@ def filter_by_mkt_cap(tickers_or_csv):
     for ticker in tqdm(tickers_or_csv, desc="Filtering Market Cap"):
         try:
             stock = yf.Ticker(ticker)
-            info = stock.fast_info # faster than stock.info
-            market_cap = info.get("market_cap", 0)
+            
+            # 1. Try fast_info property access (No .get())
+            info = stock.fast_info
+            market_cap = getattr(info, "market_cap", None)
 
-            if market_cap >= 100_000_000:
+            # 2. Robust fallback to regular .info dictionary if fast_info fails/returns None
+            if market_cap is None or market_cap == 0:
+                market_cap = stock.info.get("marketCap", 0)
+
+            # Filter threshold (100 Million)
+            if market_cap and market_cap >= 100_000_000:
                 filtered.append(ticker)
+                
         except Exception:
-            # Silently catch delisted tickers
+            # Silently catch truly delisted/broken tickers
             continue
 
-    pd.DataFrame({"TICKER": filtered}).to_csv(FILTERED_MKT_CAP_CSV, index=False)
+    
     return filtered
 
 
@@ -224,3 +246,24 @@ def filter_by_perc_move(tickers, percent_move):
             continue
 
     return filtered
+
+
+
+
+def compute_ema_position(df):
+    emas = [8, 21, 34, 55, 89]
+    ema_values = []
+
+    for e in emas:
+        ema = df['Close'].ewm(span=e, adjust=False).mean()
+        ema_values.append(ema.iloc[-1])
+
+    close = df['Close'].iloc[-1]
+
+    if close > max(ema_values):
+        return "ABOVE"
+    elif close < min(ema_values):
+        return "BELOW"
+    else:
+        return "BETWEEN"
+
