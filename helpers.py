@@ -187,9 +187,7 @@ def get_all_tickers():
         print(f"Error fetching ticker directory: {e}")
         return []
 
-#TODO: Filter functions are too slow, is it the WiFi or Code? Check it.
-#TODO: Filtering for 1-2% movers out of specific market cap gives too many stocks ( ~2K ) what other basic filters to trim down to few high probability setups
-# either breakout wise or trend wise ( near supp & res )
+
 # ---------------- FILTER BY MARKET CAP ---------------- #
 def filter_by_mkt_cap(tickers_or_csv):
     if isinstance(tickers_or_csv, str) and tickers_or_csv.lower().endswith(".csv"):

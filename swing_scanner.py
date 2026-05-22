@@ -382,6 +382,7 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
             filtered_tickers = filter_by_mkt_cap(FILTERED_MKT_CAP_CSV)
         else:
             filtered_tickers = get_all_tickers()
+            pd.DataFrame({"TICKER": filtered_tickers}).to_csv(FILTERED_MKT_CAP_CSV, index=False)
 
     filtered_tickers = filter_by_perc_move(filtered_tickers, percent_move)
 
@@ -401,6 +402,11 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
             if df is None or df.empty or len(df) < 250:
                 continue
             
+            
+            # DO NOT CONSIDER STOCKS which don't have enough volume
+            df["Vol_SMA20"] = df["Volume"].rolling(window = 20).mean()
+            if df['Vol_SMA20'].iloc[-1] < 750000:
+                continue
 
             # ---> 1. NEW: CALCULATE RSI & ADX <---
             df['RSI_14'] = compute_rsi(df, period=14)
@@ -459,18 +465,53 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                 if row.get('SELL_SIGNAL'):
                     kelfry_signals.append(f"SELL @ ${row['High']:.2f} ({date_str})")
 
+
+
+
+            # Define your indicator states
+            has_any_signal = len(adir_signals) > 0 or len(kelfry_signals) > 0
+            is_squeezing = in_6_day_squeeze == "YES" or squeeze_fired == "YES"
+            
+            # Extract calculated metrics
+            dist_to_supp = sr_metrics["ATR_DIST_FROM_SUPPORT"]
+            dist_to_res = sr_metrics["ATR_DIST_FROM_RESISTANCE"]
+            
+            # Setup our strict conditional gates
+            is_valid_breakout = False; is_valid_bounce = False
+
+            
+            # PRONG A: THE BREAKOUT PROFILE. May need to remove rsi in future
+            if is_squeezing or has_any_signal:
+                # Long Breakout Criteria
+                if (ema_position == "ABOVE_EMAS" or ema_position == "BETWEEN") and current_adx > 22:
+                    is_valid_breakout = True
+                # Short Breakout Criteria
+                elif ema_position == "BELOW_EMAS" and current_adx > 22:
+                    is_valid_breakout = True
+
+            # PRONG B: THE KEY-LEVEL BOUNCE PROFILE
+            # Long Bounce near Support. May need to remove rsi in future
+            if has_any_signal and isinstance(dist_to_supp, (int, float)) and dist_to_supp <= 0.75:
+                if current_adx < 20 or current_rsi < 40: # Ranging market or deeply oversold
+                    is_valid_bounce = True
+                    
+            # Short Bounce near Resistance
+            elif has_any_signal and isinstance(dist_to_res, (int, float)) and dist_to_res <= 0.75:
+                if current_adx < 20 or current_rsi > 60: # Ranging market or overbought
+                    is_valid_bounce = True
+
+
+            
             # 4. Actionable Filter: Include if ANY condition is met
-            if (in_6_day_squeeze == "YES" or 
-                squeeze_fired == "YES" or 
-                len(adir_signals) > 0 or 
-                len(kelfry_signals) > 0):
-                
+            if is_valid_breakout or is_valid_bounce:
+                setup_type = "BREAKOUT" if is_valid_breakout else "BOUNCE"
                 adir_value = " | ".join(adir_signals) if adir_signals else "NONE"
                 kelfry_value = " | ".join(kelfry_signals) if kelfry_signals else "NONE"
                 stock_price = df['Close'].iloc[-1]
                 
                 results.append({
                     "STOCK TICKER": ticker,
+                    "SETUP TYPE": setup_type,
                     "STOCK PRICE": round(stock_price, 2),
                     "IN 6 DAY SQUEEZE": in_6_day_squeeze,
                     "SQUEEZE_FIRED": squeeze_fired,
@@ -484,6 +525,7 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                     "RSI (14)": current_rsi,
                     "ADX (14)": current_adx
                 })
+
 
         except Exception:
             continue
