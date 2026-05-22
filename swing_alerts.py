@@ -390,56 +390,73 @@ if __name__ == "__main__":
 
     while True:
         try:
-            # By calling now(eastern), this variable is purely tied to New York time.
-            # It will correctly trigger sleep during NY night time, even if you are in India.
             now = datetime.datetime.now(eastern)
             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Check if current day is a weekday (0 = Monday, 4 = Friday)
-            if now.weekday() < 5:
-                market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+            market_open_today = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close_today = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
-                if market_open <= now <= market_close:
-                    print(f"[{timestamp} EST] Market open. Scanning watchlist...", flush=True)
+            # Check if market is currently open (Weekday AND between 9:30 AM - 4:00 PM EST)
+            if now.weekday() < 5 and market_open_today <= now <= market_close_today:
+                print(f"[{timestamp} EST] Market open. Scanning watchlist...", flush=True)
 
-                    if os.path.exists("watchlist.csv"):
-                        watchlist = pd.read_csv(
-                            "watchlist.csv",
-                            usecols=["Ticker", "Support", "Resistance", "Vol_Length", "Trade_Type"],
-                            dtype={
-                                "Ticker": "string",
-                                "Support": "float64",
-                                "Resistance": "float64",
-                                "Vol_Length": "int64",
-                                "Trade_Type": "string",
-                            },
-                        )
-                        watchlist["Trade_Type"] = watchlist["Trade_Type"].astype("string").str.strip().str.lower()
+                if os.path.exists("watchlist.csv"):
+                    watchlist = pd.read_csv(
+                        "watchlist.csv",
+                        usecols=["Ticker", "Support", "Resistance", "Vol_Length", "Trade_Type"],
+                        dtype={
+                            "Ticker": "string",
+                            "Support": "float64",
+                            "Resistance": "float64",
+                            "Vol_Length": "int64",
+                            "Trade_Type": "string",
+                        },
+                    )
+                    watchlist["Trade_Type"] = watchlist["Trade_Type"].astype("string").str.strip().str.lower()
 
-                        for ticker, support, resistance, vol_len, trade_type in watchlist.itertuples(index=False, name=None):
-                            ticker = str(ticker).strip()
+                    for ticker, support, resistance, vol_len, trade_type in watchlist.itertuples(index=False, name=None):
+                        ticker = str(ticker).strip()
 
-                            if trade_type == "breakout":
-                                check_breakout_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
-                            elif trade_type == "bounce":
-                                check_bounce_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
+                        if trade_type == "breakout":
+                            check_breakout_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
+                        elif trade_type == "bounce":
+                            check_bounce_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
 
-                            time.sleep(2)
-                    else:
-                        print(f"[{timestamp} EST] Alert: watchlist.csv not found.", flush=True)
-
-                    print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...", flush=True)
-                    time.sleep(CHECK_INTERVAL_SECONDS)
+                        time.sleep(2)
                 else:
-                    print(f"[{timestamp} EST] Market closed. Sleeping 60s...", flush=True)
-                    time.sleep(60)
+                    print(f"[{timestamp} EST] Alert: watchlist.csv not found.", flush=True)
+
+                print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...", flush=True)
+                time.sleep(CHECK_INTERVAL_SECONDS)
+
+            # MARKET IS CLOSED: Calculate exact time until next open
             else:
-                print(f"[{timestamp} EST] Weekend Mode Active. Sleeping 300s...", flush=True)
-                time.sleep(300)
+                
+                next_open = market_open_today
+                
+                # If we are already past today's close, look to tomorrow
+                if now >= market_close_today:
+                    next_open += datetime.timedelta(days=1)
+                
+                # Push forward if next_open falls on a Saturday (5) or Sunday (6)
+                while next_open.weekday() >= 5:
+                    next_open += datetime.timedelta(days=1)
+                
+                # Calculate the exact seconds to sleep
+                sleep_seconds = (next_open - now).total_seconds()
+                hours, remainder = divmod(sleep_seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+                
+                print(
+                    f"[{timestamp} EST] Market closed. Hibernating for {int(hours)}h {int(minutes)}m "
+                    f"until {next_open.strftime('%A, %Y-%m-%d %H:%M:%S')} EST...", 
+                    flush=True
+                )
+                
+                # Add 1 second buffer to ensure we wake up slightly past the threshold
+                time.sleep(sleep_seconds + 1)
 
         except Exception as global_error:
-            # Fallback timezone fetch for errors just to be safe
             error_time = datetime.datetime.now(pytz.timezone("US/Eastern")).strftime('%Y-%m-%d %H:%M:%S')
             print(f"[{error_time} EST] Runtime Exception Intercepted: {global_error}", flush=True)
             time.sleep(60)
