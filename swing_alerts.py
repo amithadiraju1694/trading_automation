@@ -32,18 +32,26 @@ CHECK_INTERVAL_SECONDS = 120
 SPY_CACHE = {"last_fetched_date": None, "is_bullish": True, "is_bearish": True}
 
 def get_spy_regime():
-    """Fetches SPY status exactly once per calendar day."""
+    """Fetches SPY status exactly once per calendar day (EST strictly)."""
     global SPY_CACHE
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    
+    # FIX: Force 'today' to be evaluated in EST. 
+    # If you are in IST, your local clock might be on Tuesday while NY is still on Monday.
+    eastern = pytz.timezone("US/Eastern")
+    now_est = datetime.datetime.now(eastern)
+    today_str = now_est.strftime("%Y-%m-%d")
 
-    if SPY_CACHE["last_fetched_date"] == today_str:
+    if SPY_CACHE.get("last_fetched_date") == today_str:
         return SPY_CACHE["is_bullish"], SPY_CACHE["is_bearish"]
 
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Refreshing global SPY Market Regime...")
+    print(f"[{now_est.strftime('%H:%M:%S')} EST] Refreshing global SPY Market Regime...")
     try:
-        spy_data = yf.download(tickers="SPY", period="3mo", interval="1d", progress=False)
+        stock = yf.Ticker("SPY")
+        spy_data = stock.history(period="3mo", interval="1d", auto_adjust=False)
+        
         if not spy_data.empty and len(spy_data) > 20:
             spy_data["SMA_20"] = spy_data["Close"].rolling(window=20).mean()
+            
             latest_spy_close = float(spy_data["Close"].iloc[-1])
             latest_spy_sma = float(spy_data["SMA_20"].iloc[-1])
 
@@ -58,11 +66,18 @@ def get_spy_regime():
     return SPY_CACHE["is_bullish"], SPY_CACHE["is_bearish"]
 
 # TO CONFIRM LONG AND SHORT ENTRIES BASED ON SCORE OR CRUDE ANDs For Key Level based trades
-def evaluate_trade_confidence(
-    swept, reclaimed, ms_flip, not_overextended, 
-    setup_present, volume_confirmed, spy_aligned, 
-    wick_rejection, strong_body, 
-    confirmation_type="weight", confidence_threshold=85
+def evaluate_bounce_confidence(
+    swept,
+    reclaimed,
+    ms_flip,
+    not_overextended, 
+    setup_present,
+    volume_confirmed,
+    spy_aligned, 
+    wick_rejection,
+    strong_body, 
+    confirmation_type="weight",
+    confidence_threshold=85
 ):
     """
     Unified evaluation engine for both Long and Short setups.
@@ -85,14 +100,20 @@ def evaluate_trade_confidence(
     if wick_rejection:   score += 15  # Price action rejection signature
     if strong_body:      score += 10  # Momentum candle close profile
 
-    return score >= confidence_threshold
+    return score >= confidence_threshold, score
 
 
 # TO CONFIRM LONG AND SHORT ENTRIES BASED ON SCORE OR CRUDE ANDs for Breakout Trades
 def evaluate_breakout_confidence(
-    started_correct_side, closed_past_level, not_overextended,
-    volume_surge, strong_close, originated_nearby, spy_aligned,
-    confirmation_type="weight", confidence_threshold=85
+    started_correct_side,
+    closed_past_level,
+    not_overextended,
+    volume_surge,
+    strong_close,
+    originated_nearby,
+    spy_aligned,
+    confirmation_type="weight",
+    confidence_threshold=85
 ):
     """
     Dedicated evaluation engine for Breakout setups.
@@ -116,11 +137,8 @@ def evaluate_breakout_confidence(
 
     return score >= confidence_threshold, score
 
-
-
-
 # Key level based entry confirmation
-def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL_LENGTH, FROM_EMAIL, TO_EMAIL):
+def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL_LENGTH, FROM_EMAIL, TO_EMAIL):
     global last_alerted_keylevel_candles
     CONFIDENCE_THRESHOLD = 55
 
@@ -131,9 +149,14 @@ def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     if raw_data.empty or len(raw_data) < 100:
         return
 
+    # FIX: Dynamic timezone anchoring to support running on IST/PST clocks
     raw_data.index = raw_data.index.tz_convert("US/Eastern")
+    first_data_date = raw_data.index[0].date()
+    data_timezone = raw_data.index.tz
+    dynamic_origin = pd.Timestamp(f"{first_data_date} 09:30:00", tz=data_timezone)
+
     agg_rules = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    df_2h = raw_data.resample("2h", origin="09:30:00").agg(agg_rules).dropna().copy()
+    df_2h = raw_data.resample("2h", origin=dynamic_origin).agg(agg_rules).dropna().copy()
 
     if len(df_2h) < (VOL_LENGTH + 10):
         return
@@ -184,7 +207,6 @@ def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     last_structural_low = float(latest_closed_bar["Last_Confirmed_Low"])
 
     # --- STEP 3: REACTIONARY VOLUME vs APPROACH VOLUME ---
-    # FIXED: Window shifted to -6:-3 to exclude index -3 from drying up validation
     approach_vol_avg = float(df_2h["Volume"].iloc[-6:-3].mean())
     vol_drying_up = approach_vol_avg < v2h_avg
     volume_confirmed = (v2h > v2h_avg) and (v2h_prev > v2h_avg)
@@ -193,7 +215,7 @@ def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     bull_divergence = (l2h < last_structural_low) and (current_rsi > float(latest_closed_bar["RSI_at_Low"]))
     bullish_setup_present = bull_divergence or vol_drying_up
 
-    price_long_confirmed = evaluate_trade_confidence(
+    price_long_confirmed, long_score = evaluate_bounce_confidence(
         swept=(l2h < SUPPORT_LEVEL),
         reclaimed=(c2h > SUPPORT_LEVEL),
         ms_flip=(c2h > last_structural_high),
@@ -211,7 +233,7 @@ def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     bear_divergence = (h2h > last_structural_high) and (current_rsi < float(latest_closed_bar["RSI_at_High"]))
     bearish_setup_present = bear_divergence or vol_drying_up
 
-    price_short_confirmed = evaluate_trade_confidence(
+    price_short_confirmed, short_score = evaluate_bounce_confidence(
         swept=(h2h > RESISTANCE_LEVEL),
         reclaimed=(c2h < RESISTANCE_LEVEL),
         ms_flip=(c2h < last_structural_low),
@@ -222,30 +244,35 @@ def check_keylevel_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
         wick_rejection=((h2h - max(o2h, c2h)) > (candle_range * 0.3)),
         strong_body=((o2h - c2h) > (candle_range * 0.5)),
         confirmation_type="weight",
-        confidence_threshold=CONFIDENCE_THRESHOLD  # FIXED: Now properly passes threshold value instead of None
+        confidence_threshold=CONFIDENCE_THRESHOLD
     )
 
     # --- STEP 6: EXECUTE ALERTS ---
     if price_long_confirmed and (current_candle_time != last_alerted_keylevel_candles[TICKER]):
         last_alerted_keylevel_candles[TICKER] = current_candle_time
         send_email(
-            subject = "*** SWING ALERT: A+ BULLISH KEY LEVEL CONFIRMED FOR : {TICKER} ***",
-            body=f"Use these ballpark entries , stop losses and take profits. Entry: {c2h}, Stop Loss (Place Below This): {l2h} and Take Profit: {RESISTANCE_LEVEL}",
-            from_email = FROM_EMAIL,
-            to_email= TO_EMAIL,
+            subject=f"*** SWING ALERT: A+ BULLISH KEY LEVEL CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            body=f"""Use these ballpark entries , stop losses and take profits.
+            Entry: {c2h}, Stop Loss (Place Below This): {l2h} and Take Profit: {RESISTANCE_LEVEL}.
+            Long Confirmation Score: {long_score} with threshold at: {CONFIDENCE_THRESHOLD}
+            """,
+            from_email=FROM_EMAIL,
+            to_email=TO_EMAIL,
             attachment=None
         )
 
     elif price_short_confirmed and (current_candle_time != last_alerted_keylevel_candles[TICKER]):
         last_alerted_keylevel_candles[TICKER] = current_candle_time
         send_email(
-            subject = "*** SWING ALERT: A+ BEARISH KEY LEVEL CONFIRMED FOR : {TICKER} ***",
-            body=f"Use these ballpark entries , stop losses and take profits. Entry: {c2h}, Stop Loss (Place Above This): {h2h} and Take Profit: {SUPPORT_LEVEL}",
-            from_email = FROM_EMAIL,
-            to_email= TO_EMAIL,
+            subject=f"*** SWING ALERT: A+ BEARISH KEY LEVEL CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            body=f"""Use these ballpark entries , stop losses and take profits.
+            Entry: {c2h}, Stop Loss (Place Above This): {h2h} and Take Profit: {SUPPORT_LEVEL}.
+            Short Confirmation Score: {short_score} with threshold at :{CONFIDENCE_THRESHOLD}
+            """,
+            from_email=FROM_EMAIL,
+            to_email=TO_EMAIL,
             attachment=None
         )
-
 
 
 # Breakout based entry confirmation
@@ -253,17 +280,20 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     global last_alerted_breakout_candles
     CONFIDENCE_THRESHOLD = 70
 
-    # 1. Fetch cached macro trend gate
     spy_is_bullish, spy_is_bearish = get_spy_regime()
 
-    # 2. Pull Ticker Data
     raw_data = yf.download(tickers=TICKER, period="1mo", interval="30m", progress=False)
     if raw_data.empty or len(raw_data) < 100:
         return
 
+    # FIX: Dynamic timezone anchoring to support running on IST/PST clocks
     raw_data.index = raw_data.index.tz_convert("US/Eastern")
+    first_data_date = raw_data.index[0].date()
+    data_timezone = raw_data.index.tz
+    dynamic_origin = pd.Timestamp(f"{first_data_date} 09:30:00", tz=data_timezone)
+
     agg_rules = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    df_2h = raw_data.resample("2h", origin="09:30:00").agg(agg_rules).dropna().copy()
+    df_2h = raw_data.resample("2h", origin=dynamic_origin).agg(agg_rules).dropna().copy()
 
     if len(df_2h) < (VOL_LENGTH + 10):
         return
@@ -282,7 +312,6 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     if TICKER not in last_alerted_breakout_candles:
         last_alerted_breakout_candles[TICKER] = None
 
-    # Bar Coordinate Unpacking
     o2h, h2h, l2h, c2h = (
         float(latest_closed_bar["Open"]), float(latest_closed_bar["High"]),
         float(latest_closed_bar["Low"]), float(latest_closed_bar["Close"])
@@ -295,10 +324,9 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     if candle_range <= 0 or pd.isna(atr):
         return
 
-    # Base breakout metrics
     volume_surge = v2h > (v2h_avg * 1.2)
 
-    # --- 3. LONG SIDE (BULLISH BREAKOUT) PIPELINE ---
+    # --- LONG SIDE (BULLISH BREAKOUT) ---
     price_long_breakout, long_score = evaluate_breakout_confidence(
         started_correct_side=(o2h < (RESISTANCE_LEVEL + (0.2 * atr))),
         closed_past_level=(c2h > RESISTANCE_LEVEL),
@@ -311,7 +339,7 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
         confidence_threshold=CONFIDENCE_THRESHOLD
     )
 
-    # --- 4. SHORT SIDE (BEARISH BREAKDOWN) PIPELINE ---
+    # --- SHORT SIDE (BEARISH BREAKDOWN) ---
     price_short_breakout, short_score = evaluate_breakout_confidence(
         started_correct_side=(o2h > (SUPPORT_LEVEL - (0.2 * atr))),
         closed_past_level=(c2h < SUPPORT_LEVEL),
@@ -324,81 +352,94 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
         confidence_threshold=CONFIDENCE_THRESHOLD
     )
 
-    # --- 5. EXECUTING ALERTS ---
+    # --- EXECUTING ALERTS ---
     if price_long_breakout and (current_candle_time != last_alerted_breakout_candles[TICKER]):
         last_alerted_breakout_candles[TICKER] = current_candle_time
         send_email(
-            subject = "*** SWING ALERT: A+ BULLISH BREAKOUT CONFIRMED FOR : {TICKER} ***",
-            #TP Is Textbook formula for "measure move", a conservative , probably first level TP
-            body=f"Use these ballpark entries , stop losses and take profits. Entry: {c2h}, Stop Loss (Place Below This): {RESISTANCE_LEVEL} and Take Profit: {c2h + (RESISTANCE_LEVEL - SUPPORT_LEVEL)}",
-            from_email = FROM_EMAIL,
-            to_email= TO_EMAIL,
+            subject=f"*** SWING ALERT: A+ BULLISH BREAKOUT CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            body=f"""Use these ballpark entries , stop losses and take profits. 
+            Entry: {c2h}, Stop Loss (Place Below This): {RESISTANCE_LEVEL} and Take Profit: {c2h + (RESISTANCE_LEVEL - SUPPORT_LEVEL)}.
+            Long Confirmation Score: {long_score} with threshold at: {CONFIDENCE_THRESHOLD}
+            """,
+            from_email=FROM_EMAIL,
+            to_email=TO_EMAIL,
             attachment=None
         )
         
-
     elif price_short_breakout and (current_candle_time != last_alerted_breakout_candles[TICKER]):
         last_alerted_breakout_candles[TICKER] = current_candle_time
         send_email(
-            subject = "*** SWING ALERT: A+ BEARISH KEY LEVEL CONFIRMED FOR : {TICKER} ***",
-            # Similar texrtbook formula for downward move
-            body=f"Use these ballpark entries , stop losses and take profits. Entry: {c2h}, Stop Loss (Place Above This): {SUPPORT_LEVEL} and Take Profit: {c2h - (RESISTANCE_LEVEL - SUPPORT_LEVEL)}",
-            from_email = FROM_EMAIL,
-            to_email= TO_EMAIL,
+            subject=f"*** SWING ALERT: A+ BEARISH BREAKOUT CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            body=f"""Use these ballpark entries , stop losses and take profits.
+            Entry: {c2h}, Stop Loss (Place Above This): {SUPPORT_LEVEL} and Take Profit: {c2h - (RESISTANCE_LEVEL - SUPPORT_LEVEL)}.
+            Short Confirmation Score: {short_score} with threshold at: {CONFIDENCE_THRESHOLD}
+            """,
+            from_email=FROM_EMAIL,
+            to_email=TO_EMAIL,
             attachment=None
         )
-        
-
-
-
 
 
 if __name__ == "__main__":
     eastern = pytz.timezone("US/Eastern")
-    print("Initializing Multi-Ticker Automated Reversal Script Engine...")
+
+    print(
+        "Initializing Multi-Ticker Automated Reversal Script Engine...",
+        flush=True,
+    )
 
     while True:
         try:
+            # By calling now(eastern), this variable is purely tied to New York time.
+            # It will correctly trigger sleep during NY night time, even if you are in India.
             now = datetime.datetime.now(eastern)
+            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Check if current day is a weekday
+            # Check if current day is a weekday (0 = Monday, 4 = Friday)
             if now.weekday() < 5:
                 market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
                 market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
                 if market_open <= now <= market_close:
-                    
-                    # Read Watchlist dynamically every loop
-                    if os.path.exists("watchlist.csv"):
+                    print(f"[{timestamp} EST] Market open. Scanning watchlist...", flush=True)
 
-                        #TODO: Filter by column trade type in watchlist.csv
-                        #TODO: if trade_type is "breakout" call "check_breakout_entry_confirmation" elif trade_type is "keylevel" call "check_keylevel_entry_confirmation"
-                        watchlist = pd.read_csv("watchlist.csv")
-                        
-                        for index, row in watchlist.iterrows():
-                            ticker = str(row['Ticker']).strip()
-                            support = float(row['Support'])
-                            resistance = float(row['Resistance'])
-                            vol_len = int(row['Vol_Length'])
-                            
-                            #TODO: Change function call here based on trade typw
-                            check_entry_confirmation(ticker, support, resistance, vol_len)
-                            
-                            # Pause briefly between tickers to prevent yfinance rate limiting
-                            time.sleep(2) 
+                    if os.path.exists("watchlist.csv"):
+                        watchlist = pd.read_csv(
+                            "watchlist.csv",
+                            usecols=["Ticker", "Support", "Resistance", "Vol_Length", "Trade_Type"],
+                            dtype={
+                                "Ticker": "string",
+                                "Support": "float64",
+                                "Resistance": "float64",
+                                "Vol_Length": "int64",
+                                "Trade_Type": "string",
+                            },
+                        )
+                        watchlist["Trade_Type"] = watchlist["Trade_Type"].astype("string").str.strip().str.lower()
+
+                        for ticker, support, resistance, vol_len, trade_type in watchlist.itertuples(index=False, name=None):
+                            ticker = str(ticker).strip()
+
+                            if trade_type == "breakout":
+                                check_breakout_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
+                            elif trade_type == "bounce":
+                                check_bounce_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
+
+                            time.sleep(2)
                     else:
-                        print("watchlist.csv not found. Please create it.")
-                    
-                    print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
+                        print(f"[{timestamp} EST] Alert: watchlist.csv not found.", flush=True)
+
+                    print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...", flush=True)
                     time.sleep(CHECK_INTERVAL_SECONDS)
                 else:
-                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Market closed. Sleeping 60s...")
+                    print(f"[{timestamp} EST] Market closed. Sleeping 60s...", flush=True)
                     time.sleep(60)
             else:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Weekend Mode Active. Sleeping 300s...")
+                print(f"[{timestamp} EST] Weekend Mode Active. Sleeping 300s...", flush=True)
                 time.sleep(300)
 
         except Exception as global_error:
-            print(f"Runtime Exception Intercepted: {global_error}")
+            # Fallback timezone fetch for errors just to be safe
+            error_time = datetime.datetime.now(pytz.timezone("US/Eastern")).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{error_time} EST] Runtime Exception Intercepted: {global_error}", flush=True)
             time.sleep(60)
-
