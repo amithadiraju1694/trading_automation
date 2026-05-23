@@ -424,12 +424,16 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                 continue
 
             # LOGIC 1: Is it currently in a 6-day squeeze?
-            in_6_day_squeeze = "YES" if squeeze_series.iloc[-6:].all() else "NO"
+            # .iloc[-6:] precisely evaluates the last 6 trading days (including today)
+            in_6_day_squeeze = "YES" if bool(squeeze_series.iloc[-6:].all()) else "NO"
 
             # LOGIC 2: Did it squeeze for 6 days prior to today, and FIRE today?
-            six_days_prior_squeeze = squeeze_series.iloc[-7:-1].all()
-            fired_on_7th = not squeeze_series.iloc[-1]
-            squeeze_fired = "YES" if (six_days_prior_squeeze and fired_on_7th) else "NO"
+            # .iloc[-7:-1] precisely evaluates the 6 days prior to today
+            # .iloc[-1] specifically targets today's candle to confirm it fired
+            six_days_prior_squeeze = bool(squeeze_series.iloc[-7:-1].all())
+            fired_today = not bool(squeeze_series.iloc[-1])
+            
+            squeeze_fired = "YES" if (six_days_prior_squeeze and fired_today) else "NO"
 
             # 3. Compute Strategy Signals
             adir_df = generate_adirindic_signal(df)

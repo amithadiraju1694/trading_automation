@@ -80,8 +80,12 @@ def compute_squeeze(df):
     length = 20
 
     # Bollinger Bands
-    sma = df['Close'].rolling(length).mean()
-    std = df['Close'].rolling(length).std()
+    sma = df['Close'].rolling(window=length).mean()
+    
+    # FIX 1: Force ddof=0 for Population Standard Deviation. 
+    # This aligns the math exactly with TradingView & ThinkOrSwim.
+    std = df['Close'].rolling(window=length).std(ddof=0)
+    
     bb_upper = sma + (2 * std)
     bb_lower = sma - (2 * std)
 
@@ -91,13 +95,16 @@ def compute_squeeze(df):
     tr3 = abs(df['Low'] - df['Close'].shift())
 
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(length).mean()
+    atr = tr.rolling(window=length).mean()
+    
     kc_upper = sma + (1.5 * atr)
     kc_lower = sma - (1.5 * atr)
 
     # Squeeze is ON when Bollinger Bands are completely inside Keltner Channels
     squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
-    return squeeze_on
+    
+    # FIX 2: Fill NaNs from rolling windows to avoid boolean logic crashes
+    return squeeze_on.fillna(False)
 
 
 
