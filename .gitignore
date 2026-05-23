@@ -2,3 +2,5 @@ setup_email.sh
 *.txt
 *.csv
 test.py
+test.ipynb
+algo_trading.ipynb
