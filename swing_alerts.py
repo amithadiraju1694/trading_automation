@@ -5,6 +5,7 @@ import pytz
 import pandas as pd
 import os
 from helpers import send_email
+import requests
 
 FROM_EMAIL = "amitadiraju3@gmail.com"
 TO_EMAIL = "amith.adiraju@gmail.com"
@@ -24,19 +25,21 @@ BREAKOUT REQUIRES ADDITIONAL CONFIDENCE AND MOMENTUM THAN HISTORICAL KEY LEVEL B
 
 last_alerted_breakout_candles = {}
 last_alerted_keylevel_candles = {}
-CHECK_INTERVAL_SECONDS = 120
+# Create a reusable session with custom headers to prevent blocks/timeouts
+yf_session = requests.Session()
+yf_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+CHECK_INTERVAL_SECONDS = 600
 
 
 
-# Global cache to prevent exhausting the API with SPY requests
 SPY_CACHE = {"last_fetched_date": None, "is_bullish": True, "is_bearish": True}
 
 def get_spy_regime():
     """Fetches SPY status exactly once per calendar day (EST strictly)."""
     global SPY_CACHE
     
-    # FIX: Force 'today' to be evaluated in EST. 
-    # If you are in IST, your local clock might be on Tuesday while NY is still on Monday.
     eastern = pytz.timezone("US/Eastern")
     now_est = datetime.datetime.now(eastern)
     today_str = now_est.strftime("%Y-%m-%d")
@@ -46,6 +49,7 @@ def get_spy_regime():
 
     print(f"[{now_est.strftime('%H:%M:%S')} EST] Refreshing global SPY Market Regime...")
     try:
+        # FIX: Removed session parameter entirely. Let yfinance handle curl_cffi internally.
         stock = yf.Ticker("SPY")
         spy_data = stock.history(period="3mo", interval="1d", auto_adjust=False)
         
@@ -64,6 +68,8 @@ def get_spy_regime():
         SPY_CACHE["is_bearish"] = True
 
     return SPY_CACHE["is_bullish"], SPY_CACHE["is_bearish"]
+
+
 
 # TO CONFIRM LONG AND SHORT ENTRIES BASED ON SCORE OR CRUDE ANDs For Key Level based trades
 def evaluate_bounce_confidence(
@@ -86,11 +92,13 @@ def evaluate_bounce_confidence(
     # 1. Non-Negotiable Structural Vetoes
     structural_vetoes_pass = swept and reclaimed and ms_flip and not_overextended
     if not structural_vetoes_pass:
-        return False
+        return False, 0.0
 
     # 2. Strict Boolean Confirmation Pathway
     if confirmation_type != "weight":
-        return (spy_aligned and setup_present and strong_body and wick_rejection and volume_confirmed)
+        return_decision = spy_aligned and setup_present and strong_body and wick_rejection and volume_confirmed
+        if return_decision: return return_decision, 1.0
+        return False, 0.0
 
     # 3. Weighted Scoring Pathway
     score = 0
@@ -121,12 +129,12 @@ def evaluate_breakout_confidence(
     # 1. Non-Negotiable Structural Vetoes
     structural_vetoes_pass = started_correct_side and closed_past_level and not_overextended
     if not structural_vetoes_pass:
-        return False, 0
+        return False, 0.0
 
     # 2. Strict Boolean Confirmation Pathway
     if confirmation_type != "weight":
         is_confirmed = (spy_aligned and volume_surge and strong_close and originated_nearby)
-        return is_confirmed, 100 if is_confirmed else 0
+        return is_confirmed, 100 if is_confirmed else False,0.0
 
     # 3. Weighted Scoring Pathway
     score = 0
@@ -137,19 +145,24 @@ def evaluate_breakout_confidence(
 
     return score >= confidence_threshold, score
 
-# Key level based entry confirmation
+
+
 def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL_LENGTH, FROM_EMAIL, TO_EMAIL):
     global last_alerted_keylevel_candles
     CONFIDENCE_THRESHOLD = 55
 
-    # --- STEP 1: MARKET CONTEXT & DATA ACQUISITION ---
     spy_is_bullish, spy_is_bearish = get_spy_regime()
 
+    # FIX: Removed session parameter entirely
     raw_data = yf.download(tickers=TICKER, period="1mo", interval="30m", progress=False)
     if raw_data.empty or len(raw_data) < 100:
         return
 
-    # FIX: Dynamic timezone anchoring to support running on IST/PST clocks
+    # KEEP: Flatten MultiIndex columns to resolve "Label do not exist" errors
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        raw_data.columns = raw_data.columns.get_level_values(0)
+
+    # Dynamic timezone anchoring
     raw_data.index = raw_data.index.tz_convert("US/Eastern")
     first_data_date = raw_data.index[0].date()
     data_timezone = raw_data.index.tz
@@ -168,13 +181,13 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
     tr3 = (df_2h["Low"] - df_2h["Close"].shift(1)).abs()
     df_2h["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-    # Calculate 2H RSI for Divergence Math
+    # Calculate 2H RSI
     delta = df_2h["Close"].diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
     loss = -delta.where(delta < 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
     df_2h["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
-    # --- STEP 2: STRUCTURAL PIVOT TRACKING ---
+    # Structural Pivot Tracking
     df_2h["Is_Swing_High"] = (df_2h["High"] == df_2h["High"].rolling(window=5, center=True).max())
     df_2h["Is_Swing_Low"] = (df_2h["Low"] == df_2h["Low"].rolling(window=5, center=True).min())
 
@@ -191,7 +204,6 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
     if TICKER not in last_alerted_keylevel_candles:
         last_alerted_keylevel_candles[TICKER] = None
 
-    # Bar Coordinate Unpacking
     o2h, h2h, l2h, c2h = (
         float(latest_closed_bar["Open"]), float(latest_closed_bar["High"]),
         float(latest_closed_bar["Low"]), float(latest_closed_bar["Close"])
@@ -206,12 +218,11 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
     last_structural_high = float(latest_closed_bar["Last_Confirmed_High"])
     last_structural_low = float(latest_closed_bar["Last_Confirmed_Low"])
 
-    # --- STEP 3: REACTIONARY VOLUME vs APPROACH VOLUME ---
     approach_vol_avg = float(df_2h["Volume"].iloc[-6:-3].mean())
     vol_drying_up = approach_vol_avg < v2h_avg
     volume_confirmed = (v2h > v2h_avg) and (v2h_prev > v2h_avg)
 
-    # --- STEP 4: LONG SIDE CONFIRMATION PIPELINE ---
+    # --- LONG SIDE ---
     bull_divergence = (l2h < last_structural_low) and (current_rsi > float(latest_closed_bar["RSI_at_Low"]))
     bullish_setup_present = bull_divergence or vol_drying_up
 
@@ -229,7 +240,7 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
         confidence_threshold=CONFIDENCE_THRESHOLD
     )
 
-    # --- STEP 5: SHORT SIDE CONFIRMATION PIPELINE ---
+    # --- SHORT SIDE ---
     bear_divergence = (h2h > last_structural_high) and (current_rsi < float(latest_closed_bar["RSI_at_High"]))
     bearish_setup_present = bear_divergence or vol_drying_up
 
@@ -247,11 +258,11 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
         confidence_threshold=CONFIDENCE_THRESHOLD
     )
 
-    # --- STEP 6: EXECUTE ALERTS ---
+    # --- EXECUTE ALERTS ---
     if price_long_confirmed and (current_candle_time != last_alerted_keylevel_candles[TICKER]):
         last_alerted_keylevel_candles[TICKER] = current_candle_time
         send_email(
-            subject=f"*** SWING ALERT: A+ BULLISH KEY LEVEL CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            subject=f"*** SWING ALERT: A+ BULLISH KEY LEVEL CONFIRMED FOR : {TICKER} ***",
             body=f"""Use these ballpark entries , stop losses and take profits.
             Entry: {c2h}, Stop Loss (Place Below This): {l2h} and Take Profit: {RESISTANCE_LEVEL}.
             Long Confirmation Score: {long_score} with threshold at: {CONFIDENCE_THRESHOLD}
@@ -261,10 +272,12 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
             attachment=None
         )
 
+        print("Found Confirmation for : {TICKER} email delivery successful !")
+
     elif price_short_confirmed and (current_candle_time != last_alerted_keylevel_candles[TICKER]):
         last_alerted_keylevel_candles[TICKER] = current_candle_time
         send_email(
-            subject=f"*** SWING ALERT: A+ BEARISH KEY LEVEL CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            subject=f"*** SWING ALERT: A+ BEARISH KEY LEVEL CONFIRMED FOR : {TICKER} ***",
             body=f"""Use these ballpark entries , stop losses and take profits.
             Entry: {c2h}, Stop Loss (Place Above This): {h2h} and Take Profit: {SUPPORT_LEVEL}.
             Short Confirmation Score: {short_score} with threshold at :{CONFIDENCE_THRESHOLD}
@@ -274,19 +287,27 @@ def check_bounce_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL
             attachment=None
         )
 
+        print("Found Confirmation for : {TICKER} email delivery successful !")
 
-# Breakout based entry confirmation
+
+
+
 def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, VOL_LENGTH, FROM_EMAIL, TO_EMAIL):
     global last_alerted_breakout_candles
     CONFIDENCE_THRESHOLD = 70
 
     spy_is_bullish, spy_is_bearish = get_spy_regime()
 
+    # FIX: Removed session parameter entirely
     raw_data = yf.download(tickers=TICKER, period="1mo", interval="30m", progress=False)
     if raw_data.empty or len(raw_data) < 100:
         return
 
-    # FIX: Dynamic timezone anchoring to support running on IST/PST clocks
+    # KEEP: Flatten MultiIndex columns to resolve "Label do not exist" errors
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        raw_data.columns = raw_data.columns.get_level_values(0)
+
+    # Dynamic timezone anchoring
     raw_data.index = raw_data.index.tz_convert("US/Eastern")
     first_data_date = raw_data.index[0].date()
     data_timezone = raw_data.index.tz
@@ -356,7 +377,7 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
     if price_long_breakout and (current_candle_time != last_alerted_breakout_candles[TICKER]):
         last_alerted_breakout_candles[TICKER] = current_candle_time
         send_email(
-            subject=f"*** SWING ALERT: A+ BULLISH BREAKOUT CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            subject=f"*** SWING ALERT: A+ BULLISH BREAKOUT CONFIRMED FOR : {TICKER} ***",
             body=f"""Use these ballpark entries , stop losses and take profits. 
             Entry: {c2h}, Stop Loss (Place Below This): {RESISTANCE_LEVEL} and Take Profit: {c2h + (RESISTANCE_LEVEL - SUPPORT_LEVEL)}.
             Long Confirmation Score: {long_score} with threshold at: {CONFIDENCE_THRESHOLD}
@@ -365,11 +386,12 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
             to_email=TO_EMAIL,
             attachment=None
         )
+        print("Found Confirmation for : {TICKER} email delivery successful !")
         
     elif price_short_breakout and (current_candle_time != last_alerted_breakout_candles[TICKER]):
         last_alerted_breakout_candles[TICKER] = current_candle_time
         send_email(
-            subject=f"*** SWING ALERT: A+ BEARISH BREAKOUT CONFIRMED FOR : {TICKER} ***", # FIX: Added 'f' prefix
+            subject=f"*** SWING ALERT: A+ BEARISH BREAKOUT CONFIRMED FOR : {TICKER} ***",
             body=f"""Use these ballpark entries , stop losses and take profits.
             Entry: {c2h}, Stop Loss (Place Above This): {SUPPORT_LEVEL} and Take Profit: {c2h - (RESISTANCE_LEVEL - SUPPORT_LEVEL)}.
             Short Confirmation Score: {short_score} with threshold at: {CONFIDENCE_THRESHOLD}
@@ -379,12 +401,14 @@ def check_breakout_entry_confirmation(TICKER, SUPPORT_LEVEL, RESISTANCE_LEVEL, V
             attachment=None
         )
 
+        print("Found Confirmation for : {TICKER} email delivery successful !")
+
 
 if __name__ == "__main__":
     eastern = pytz.timezone("US/Eastern")
 
     print(
-        "Initializing Multi-Ticker Automated Reversal Script Engine...",
+        "Initializing Multi-Ticker Automated Entry Confirmation Engine...",
         flush=True,
     )
 
@@ -403,26 +427,35 @@ if __name__ == "__main__":
                 if os.path.exists("watchlist.csv"):
                     watchlist = pd.read_csv(
                         "watchlist.csv",
-                        usecols=["Ticker", "Support", "Resistance", "Vol_Length", "Trade_Type"],
+                        usecols=["Ticker", "Support", "Resistance", "Vol_Length", "Trade_Type", "Entry_Date"],
                         dtype={
                             "Ticker": "string",
                             "Support": "float64",
                             "Resistance": "float64",
                             "Vol_Length": "int64",
                             "Trade_Type": "string",
+                            "Entry_Date": "string",
                         },
                     )
                     watchlist["Trade_Type"] = watchlist["Trade_Type"].astype("string").str.strip().str.lower()
 
-                    for ticker, support, resistance, vol_len, trade_type in watchlist.itertuples(index=False, name=None):
+                    for ticker, support, resistance, vol_len, trade_type, entry_date in watchlist.itertuples(index=False, name=None):
                         ticker = str(ticker).strip()
+                        
+                        # Check if entry date is more than 2 weeks old
+                        entry_date_obj = pd.to_datetime(entry_date)
+                        days_since_entry = (now.date() - entry_date_obj.date()).days
+                        
+                        if days_since_entry > 14:
+                            print(f"[{timestamp} EST] ⚠️  SKIP - {ticker}: Entry date ({entry_date}) is {days_since_entry} days old (>14 days). Please manually remove this ticker from watchlist.csv", flush=True)
+                            continue
 
                         if trade_type == "breakout":
                             check_breakout_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
                         elif trade_type == "bounce":
                             check_bounce_entry_confirmation(ticker, support, resistance, vol_len, FROM_EMAIL, TO_EMAIL)
 
-                        time.sleep(2)
+                        time.sleep(10)
                 else:
                     print(f"[{timestamp} EST] Alert: watchlist.csv not found.", flush=True)
 
