@@ -256,23 +256,39 @@ def filter_by_perc_move(tickers, percent_move):
 
 
 def compute_ema_position(df):
-    emas = [8, 21, 34, 55, 89]
-    ema_values = []
+    close_series = df["Close"]
+    ema8 = close_series.ewm(span=8, adjust=False).mean().iloc[-1]
+    ema21 = close_series.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema34 = close_series.ewm(span=34, adjust=False).mean().iloc[-1]
+    ema55 = close_series.ewm(span=55, adjust=False).mean().iloc[-1]
+    ema89 = close_series.ewm(span=89, adjust=False).mean().iloc[-1]
 
-    for e in emas:
-        ema = df['Close'].ewm(span=e, adjust=False).mean()
-        ema_values.append(ema.iloc[-1])
+    close = close_series.iloc[-1]
+    max_ema = max(ema8, ema21, ema34, ema55, ema89)
+    min_ema = min(ema8, ema21, ema34, ema55, ema89)
 
-    close = df['Close'].iloc[-1]
-
-    if close > max(ema_values):
-        return "ABOVE"
-    elif close < min(ema_values):
-        return "BELOW"
+    if close > max_ema:
+        ema_position = "ABOVE_EMAS"
+    elif close < min_ema:
+        ema_position = "BELOW_EMAS"
     else:
-        return "BETWEEN"
+        ema_position = "BETWEEN"
+
+    if (ema8 > ema21) and (ema21 > ema34) and (ema34 > ema55) and (ema55 > ema89):
+        ema_comparison = "STRICT BULLISH"
+    elif (ema8 < ema21) and (ema21 < ema34) and (ema34 < ema55) and (ema55 < ema89):
+        ema_comparison = "STRICT BEARISH"
+    elif (ema8 < ema21) and (ema21 > ema34) and (ema34 > ema55) and (ema55 > ema89):
+        ema_comparison = "PULLBACK BULLISH LT BUY"
+    elif (ema8 > ema21) and (ema21 > ema34) and ((ema34 < ema55) or (ema55 < ema89)):
+        ema_comparison = "REVERSAL BULLISH STRBUY"
+    else:
+        ema_comparison = "NEUTRAL"
+
+    return ema_position, ema_comparison
 
 
+ 
 # Computes a stock's Long levels #
 def calculate_long_levels(stock_price, atr, sl_mult_1, tp_mult_1, sl_mult_2=None, tp_mult_2=None):
     """
@@ -310,7 +326,77 @@ def calculate_original_levels_short(stock_price, atr, sl_mult_1, tp_mult_1, sl_m
         
     return levels
 
+# Inverse Stock Long Levels ( when original is short)
+def calculate_inverse_levels_short(inverse_entry, stock_entry, original_levels, leverage=1):
+    """
+    Translates underlying stock targets to an inverse Long ETP position.
+    - Underlying increases (hits SL) -> Inverse ETP drops to ETP SL.
+    - Underlying decreases (hits TP) -> Inverse ETP rises to ETP TP.
+    """
+    inverse_levels = {}
+    
+    for level_name, original_price in original_levels.items():
+        if 'SL' in level_name:
+            # Underlying stock moved UP: Inverse ETP moves DOWN
+            pct_change = (original_price - stock_entry) / stock_entry
+            inverse_levels[level_name] = round(inverse_entry * (1 - (leverage * pct_change)), 2)
+            
+        elif 'TP' in level_name:
+            # Underlying stock moved DOWN: Inverse ETP moves UP
+            pct_change = (stock_entry - original_price) / stock_entry
+            inverse_levels[level_name] = round(inverse_entry * (1 + (leverage * pct_change)), 2)
+            
+    return inverse_levels
 
+
+# If Original is long, how much will inverse be shorted
+def calculate_short_inverse_levels(inverse_entry, stock_entry, original_long_levels, leverage=1):
+    """
+    Translates underlying Long targets to a Short Inverse ETP position.
+    - Underlying increases (hits TP) -> Inverse ETP drops (ETP TP target achieved).
+    - Underlying decreases (hits SL) -> Inverse ETP rises (ETP SL hit).
+    """
+    inverse_levels = {}
+    
+    for level_name, original_price in original_long_levels.items():
+        if 'SL' in level_name:
+            # Underlying stock moved DOWN: Inverse ETP moves UP (This is your ETP Stop Loss)
+            pct_change = (stock_entry - original_price) / stock_entry
+            inverse_levels[level_name] = round(inverse_entry * (1 + (leverage * pct_change)), 2)
+            
+        elif 'TP' in level_name:
+            # Underlying stock moved UP: Inverse ETP moves DOWN (This is your ETP Take Profit target)
+            pct_change = (original_price - stock_entry) / stock_entry
+            inverse_levels[level_name] = round(inverse_entry * (1 - (leverage * pct_change)), 2)
+            
+    return inverse_levels
+
+# If QQQ is Long, how much will TQQQ move in same direction
+def calculate_leveraged_long_levels(leveraged_entry, stock_entry, original_long_levels, leverage=3):
+    """
+    Translates underlying Long targets to a Long Leveraged ETP position (e.g., TQQQ).
+    - Underlying increases (hits TP) -> Leveraged ETP moves UP (ETP TP).
+    - Underlying decreases (hits SL) -> Leveraged ETP moves DOWN (ETP SL).
+    """
+    leveraged_levels = {}
+    
+    for level_name, original_price in original_long_levels.items():
+        if 'SL' in level_name:
+            # Underlying stock moved DOWN: Leveraged ETP moves DOWN
+            pct_change = (stock_entry - original_price) / stock_entry
+            leveraged_levels[level_name] = round(leveraged_entry * (1 - (leverage * pct_change)), 2)
+            
+        elif 'TP' in level_name:
+            # Underlying stock moved UP: Leveraged ETP moves UP
+            pct_change = (original_price - stock_entry) / stock_entry
+            leveraged_levels[level_name] = round(leveraged_entry * (1 + (leverage * pct_change)), 2)
+            
+    return leveraged_levels
+
+
+
+# ------------------------------------------- #
+# SINGLE LEG OPTION TP AND SL LEVELS ALONG WITH VIABILITY
 # Evaluate if a option contract makes sense for small account #
 # For calls Delta must be +ve. Works for both.
 def evaluate_option_trade_viability(
@@ -480,3 +566,204 @@ def calculate_option_exit_prices(
         "option_tp2": get_option_price(stock_tp2),
         "option_sl2": get_option_price(stock_sl2)
     }
+
+"""
+Scan: Run the script with only your Long Leg data. Leave the short parameters at 0.0.
+Identify: The script will output "Recommended_Short_Strike": 160.
+Fetch & Re-run: Look up the $160 Call on your broker, grab its premium, Delta, Gamma, and Theta, and plug them into the short_ parameters of the function.
+Deploy: The script will return exactly what the Net Spread will be worth at your TP1 and SL1 levels.
+
+"""
+# ------------------------------------------- #
+# DOUBLE LEG OPTION TP AND SL Levels computation WITHOUT R:R Filter
+def calculate_debit_spread_exits(
+    major_direction: str,
+    stock_entry: float,
+    stock_atr: float,
+    stock_tp1: float,
+    stock_sl1: float,
+    long_strike: float,
+    long_premium: float,
+    long_delta: float,
+    long_gamma: float,
+    long_theta: float,
+    stock_tp2: float = None,
+    stock_sl2: float = None,
+    short_premium: float = 0.0,
+    short_delta: float = 0.0,
+    short_gamma: float = 0.0,
+    short_theta: float = 0.0
+) -> dict:
+    
+    direction = major_direction.strip().upper()
+    if direction not in ["CALL BUY", "PUT BUY"]:
+        raise ValueError("major_direction must be 'CALL BUY' or 'PUT BUY'")
+
+    # 1. Determine the Optimal Short Strike
+    # For debit spreads, always sell the strike exactly at your primary target.
+    ideal_short_strike = stock_tp1
+    
+    # 2. Safety Gate: Prevent inverted/credit spreads
+    if direction == "CALL BUY" and ideal_short_strike <= long_strike:
+        print("WARNING: Selling a call below your long strike creates a Bearish Credit Spread. Short strike should be > Long strike.")
+    elif direction == "PUT BUY" and ideal_short_strike >= long_strike:
+        print("WARNING: Selling a put above your long strike creates a Bullish Credit Spread. Short strike should be < Long strike.")
+
+    # Greeks handling: Calls are positive delta, Puts are negative delta.
+    # The Short Leg delta is naturally inverted because you are selling it, 
+    # but we handle the subtraction logically below, so input the raw broker Greeks.
+    eff_long_delta = abs(long_delta) if direction == "CALL BUY" else -abs(long_delta)
+    eff_short_delta = abs(short_delta) if direction == "CALL BUY" else -abs(short_delta)
+    
+    abs_long_theta = abs(long_theta)
+    abs_short_theta = abs(short_theta) # Short theta becomes a positive tailwind
+
+    def project_leg_price(stock_target: float, entry_prem: float, delta: float, 
+                          gamma: float, abs_theta: float) -> float:
+        if stock_target is None: return 0.0
+        
+        stock_move = stock_target - stock_entry
+        est_days = abs(stock_move) / stock_atr if stock_atr > 0 else 0
+        
+        # Taylor Series Expansion
+        delta_impact = stock_move * delta
+        gamma_impact = 0.5 * gamma * (stock_move ** 2)
+        decay = abs_theta * est_days
+        
+        final_prem = (entry_prem + delta_impact + gamma_impact) - decay
+        return max(0.01, final_prem) # Minimum market price
+
+    def get_net_spread_price(stock_target: float) -> float:
+        if stock_target is None: return None
+        
+        long_leg_val = project_leg_price(stock_target, long_premium, eff_long_delta, long_gamma, abs_long_theta)
+        short_leg_val = project_leg_price(stock_target, short_premium, eff_short_delta, short_gamma, abs_short_theta)
+        
+        # Net Spread Value = Value of the leg you own MINUS value of the leg you owe
+        net_value = long_leg_val - short_leg_val
+        return round(max(0.01, net_value), 2)
+
+    # 3. Compile the Output
+    net_entry_cost = round(long_premium - short_premium, 2)
+    
+    results = {
+        "Recommended_Short_Strike": ideal_short_strike,
+        "Net_Spread_Entry_Cost": net_entry_cost,
+        "Net_Spread_TP1": get_net_spread_price(stock_tp1),
+        "Net_Spread_SL1": get_net_spread_price(stock_sl1)
+    }
+    
+    if stock_tp2 is not None and stock_sl2 is not None:
+        results["Net_Spread_TP2"] = get_net_spread_price(stock_tp2)
+        results["Net_Spread_SL2"] = get_net_spread_price(stock_sl2)
+        
+    return results
+
+
+# WITH R:R Filter and other gaurdrails for small accounts
+def evaluate_debit_spread_trade(
+    major_direction: str,
+    stock_entry: float,
+    stock_atr: float,
+    stock_tp1: float,
+    stock_sl1: float,
+    long_strike: float,
+    long_premium: float,
+    long_delta: float,
+    long_gamma: float,
+    long_theta: float,
+    short_premium: float = 0.0,
+    short_delta: float = 0.0,
+    short_gamma: float = 0.0,
+    short_theta: float = 0.0,
+    stock_tp2: float = None,
+    stock_sl2: float = None
+) -> tuple:
+    
+    direction = major_direction.strip().upper()
+    if direction not in ["CALL BUY", "PUT BUY"]:
+        raise ValueError("major_direction must be 'CALL BUY' or 'PUT BUY'")
+
+    # 1. Determine the Optimal Short Strike & Spread Width
+    ideal_short_strike = stock_tp1
+    spread_width = abs(ideal_short_strike - long_strike)
+
+    # Greeks handling: Calls are positive delta, Puts are negative delta.
+    eff_long_delta = abs(long_delta) if direction == "CALL BUY" else -abs(long_delta)
+    eff_short_delta = abs(short_delta) if direction == "CALL BUY" else -abs(short_delta)
+    
+    abs_long_theta = abs(long_theta)
+    abs_short_theta = abs(short_theta) 
+
+    def project_leg_price(stock_target: float, entry_prem: float, delta: float, 
+                          gamma: float, abs_theta: float) -> float:
+        if stock_target is None: return 0.0
+        
+        stock_move = stock_target - stock_entry
+        est_days = abs(stock_move) / stock_atr if stock_atr > 0 else 0
+        
+        delta_impact = stock_move * delta
+        gamma_impact = 0.5 * gamma * (stock_move ** 2)
+        decay = abs_theta * est_days
+        
+        final_prem = (entry_prem + delta_impact + gamma_impact) - decay
+        return max(0.01, final_prem) 
+
+    def get_net_spread_price(stock_target: float) -> float:
+        if stock_target is None: return None
+        
+        long_leg_val = project_leg_price(stock_target, long_premium, eff_long_delta, long_gamma, abs_long_theta)
+        short_leg_val = project_leg_price(stock_target, short_premium, eff_short_delta, short_gamma, abs_short_theta)
+        
+        net_value = long_leg_val - short_leg_val
+        return round(max(0.01, net_value), 2)
+
+    # 2. Calculate Base Metrics
+    net_entry_cost = round(long_premium - short_premium, 2)
+    net_spread_tp1 = get_net_spread_price(stock_tp1)
+    net_spread_sl1 = get_net_spread_price(stock_sl1)
+
+    # 3. Calculate Risk vs. Reward
+    # Reward is what you make on top of what you paid. Risk is what you lose from your initial cost.
+    projected_reward = net_spread_tp1 - net_entry_cost
+    projected_risk = net_entry_cost - net_spread_sl1
+    
+    # Prevent division by zero if Stop Loss projection perfectly equals entry cost
+    if projected_risk <= 0:
+        projected_risk = 0.01 
+        
+    spread_rr = round(projected_reward / projected_risk, 2)
+
+    # 4. SMALL ACCOUNT GUARDRAILS
+    is_viable = True
+    fail_reasons = []
+
+    # Guardrail A: The 50% Cap Rule
+    max_allowed_cost = spread_width * 0.50
+    if net_entry_cost > max_allowed_cost:
+        is_viable = False
+        fail_reasons.append(f"Cost (${net_entry_cost}) exceeds 50% of Spread Width (${max_allowed_cost}).")
+
+    # Guardrail B: The 2.0 R:R Rule
+    if spread_rr < 2.0:
+        is_viable = False
+        fail_reasons.append(f"Spread R:R is only {spread_rr}. Minimum required is 2.0.")
+
+    # 5. Compile the Output
+    metrics = {
+        "Recommended_Short_Strike": ideal_short_strike,
+        "Spread_Width": spread_width,
+        "Net_Spread_Entry_Cost": net_entry_cost,
+        "Net_Spread_TP1": net_spread_tp1,
+        "Net_Spread_SL1": net_spread_sl1,
+        "Projected_Reward": round(projected_reward, 2),
+        "Projected_Risk": round(projected_risk, 2),
+        "Spread_RR": spread_rr,
+        "Fail_Reasons": fail_reasons if not is_viable else ["None - Trade is strictly viable."]
+    }
+    
+    if stock_tp2 is not None and stock_sl2 is not None:
+        metrics["Net_Spread_TP2"] = get_net_spread_price(stock_tp2)
+        metrics["Net_Spread_SL2"] = get_net_spread_price(stock_sl2)
+        
+    return is_viable, metrics

@@ -438,7 +438,7 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
             # 3. Compute Strategy Signals
             adir_df = generate_adirindic_signal(df)
             kelfry_df = generate_kelfry_signal(df)    
-            ema_position = compute_ema_position(df)
+            ema_position, ema_comparison = compute_ema_position(df)
 
             # 4. Computing Distance from Key levels for this ticker
             # Using 1.5% tolerance (0.015) for zone clustering. Only sending 3 years to counter stock split s&r levels
@@ -520,6 +520,7 @@ def run_scan(filtered_tickers=None, percent_move=DEFAULT_PERCENT_MOVE):
                     "IN 6 DAY SQUEEZE": in_6_day_squeeze,
                     "SQUEEZE_FIRED": squeeze_fired,
                     "PRICE RELATIVE TO EMA": ema_position,
+                    "EMA_COMPARISON": ema_comparison,
                     "ADIRINDIC": adir_value,
                     "KELFRY98": kelfry_value,
                     "ATR DIST TO SUPPORT": sr_metrics["ATR_DIST_FROM_SUPPORT"],
